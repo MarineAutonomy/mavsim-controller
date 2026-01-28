@@ -1,0 +1,11 @@
+services:
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    container_name: mavsim-sensor-bridge-test
+    volumes:
+      - .:/app
+    command: bash test_task_1_3.sh
+    environment:
+      - PYTHONUNBUFFERED=1

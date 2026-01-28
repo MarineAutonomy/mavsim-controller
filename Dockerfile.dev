@@ -1,0 +1,30 @@
+# Dockerfile for mavsim Sensor Bridge Development
+# Used for testing and development
+
+FROM python:3.11-slim
+
+# Set working directory
+WORKDIR /app
+
+# Install system dependencies if needed
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    bash \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements first for better layer caching
+COPY requirements.txt .
+
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy the entire sensor_bridge directory
+COPY . .
+
+# Install the package in editable mode
+RUN pip install --no-cache-dir -e .
+
+# Set Python unbuffered for real-time logging
+ENV PYTHONUNBUFFERED=1
+
+# Default command (can be overridden)
+CMD ["bash", "test_task_1_1.sh"]
