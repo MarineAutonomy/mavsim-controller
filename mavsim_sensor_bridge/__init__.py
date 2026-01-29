@@ -15,6 +15,7 @@ The bridge provides separate WebSocket servers for different sensor types:
 __version__ = "0.1.0"
 
 # Main exports
-from mavsim_sensor_bridge.bridge import SensorBridge, BridgeConfig
+from mavsim_sensor_bridge.bridge import SensorBridge
+from mavsim_sensor_bridge.config import BridgeConfig
 
 __all__ = ["SensorBridge", "BridgeConfig", "__version__"]

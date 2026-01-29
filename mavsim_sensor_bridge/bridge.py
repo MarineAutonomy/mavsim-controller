@@ -7,25 +7,10 @@ for starting/stopping servers, registering callbacks, and managing configuration
 
 import asyncio
 import logging
-from dataclasses import dataclass
 from typing import Callable, Dict, Optional
 
+from mavsim_sensor_bridge.config import BridgeConfig
 from mavsim_sensor_bridge.servers.camera import CameraSensorServer
-
-
-@dataclass
-class BridgeConfig:
-    """
-    Configuration for the SensorBridge.
-    
-    Attributes:
-        camera_port: Port for camera server (default: 8765)
-        camera_enabled: Whether to enable camera server (default: True)
-        log_level: Logging level (default: logging.INFO)
-    """
-    camera_port: int = 8765
-    camera_enabled: bool = True
-    log_level: int = logging.INFO
 
 
 class SensorBridge:
