@@ -3,7 +3,7 @@ Sensor server implementations for the MAVSIM Local Sensor Bridge.
 
 This package contains WebSocket server implementations for different sensor types:
 - BaseSensorServer: Abstract base class for all sensor servers
-- CameraSensorServer: Camera frame streaming (to be implemented in Task 1.4)
+- CameraSensorServer: Camera frame streaming (implemented in Task 1.4)
 - LidarSensorServer: Lidar scan streaming (to be implemented in later tasks)
 - SonarSensorServer: Imaging sonar streaming (to be implemented in later tasks)
 - DepthCameraSensorServer: Depth camera streaming (to be implemented in later tasks)
@@ -11,5 +11,6 @@ This package contains WebSocket server implementations for different sensor type
 """
 
 from mavsim_sensor_bridge.servers.base import BaseSensorServer
+from mavsim_sensor_bridge.servers.camera import CameraSensorServer
 
-__all__ = ["BaseSensorServer"]
+__all__ = ["BaseSensorServer", "CameraSensorServer"]

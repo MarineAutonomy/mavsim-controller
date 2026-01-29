@@ -6,6 +6,6 @@ services:
     container_name: mavsim-sensor-bridge-test
     volumes:
       - .:/app
-    command: bash test_task_1_3.sh
+    command: bash test_task_1_4.sh
     environment:
       - PYTHONUNBUFFERED=1
