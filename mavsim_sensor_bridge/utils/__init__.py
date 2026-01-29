@@ -20,6 +20,7 @@ from mavsim_sensor_bridge.utils.binary import (
     SONAR_HEADER_SIZE,
     DEPTH_HEADER_SIZE,
 )
+from mavsim_sensor_bridge.utils.stats import StatsCollector
 
 __all__ = [
     'pack_camera_frame',
@@ -35,4 +36,5 @@ __all__ = [
     'LIDAR_HEADER_SIZE',
     'SONAR_HEADER_SIZE',
     'DEPTH_HEADER_SIZE',
+    'StatsCollector',
 ]
