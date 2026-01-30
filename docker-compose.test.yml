@@ -1,11 +1,40 @@
+# sensor_bridge/docker-compose.test.yml
+# Task 1.9: Docker Development Environment - bridge + test runner services
+# Note: version is omitted (obsolete in Docker Compose v2+)
+
 services:
+  bridge:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    ports:
+      - "8765:8765"
+      - "8766:8766"
+      - "8767:8767"
+      - "8768:8768"
+      - "8769:8769"
+    volumes:
+      - .:/app
+    command: python -m mavsim_sensor_bridge --verbose
+    healthcheck:
+      # WebSocket handshake (not raw TCP) so the server does not log "opening handshake failed"
+      test: ["CMD", "python", "scripts/healthcheck_ws.py"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+    environment:
+      - PYTHONUNBUFFERED=1
+
   test:
     build:
       context: .
       dockerfile: Dockerfile.dev
-    container_name: mavsim-sensor-bridge-test
+    depends_on:
+      bridge:
+        condition: service_healthy
     volumes:
       - .:/app
-    command: bash test_task_1_5.sh
     environment:
+      - BRIDGE_HOST=bridge
       - PYTHONUNBUFFERED=1
+    command: pytest tests/integration/test_task_1_9_docker.py -v
