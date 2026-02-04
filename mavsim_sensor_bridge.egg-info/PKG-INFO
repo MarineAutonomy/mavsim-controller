@@ -1,4 +1,4 @@
-Metadata-Version: 2.4
+Metadata-Version: 2.1
 Name: mavsim-sensor-bridge
 Version: 0.1.0
 Summary: Local sensor bridge for MAVSIM high-bandwidth perception sensor streaming
@@ -16,6 +16,7 @@ Requires-Python: >=3.8
 Description-Content-Type: text/markdown
 Requires-Dist: websockets>=11.0
 Requires-Dist: numpy>=1.20.0
+Requires-Dist: pyyaml>=6.0
 Provides-Extra: dev
 Requires-Dist: pytest>=7.0.0; extra == "dev"
 Requires-Dist: pytest-asyncio>=0.21.0; extra == "dev"

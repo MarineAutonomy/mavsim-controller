@@ -1,5 +1,9 @@
 pyproject.toml
 mavsim_sensor_bridge/__init__.py
+mavsim_sensor_bridge/__main__.py
+mavsim_sensor_bridge/bridge.py
+mavsim_sensor_bridge/cli.py
+mavsim_sensor_bridge/config.py
 mavsim_sensor_bridge.egg-info/PKG-INFO
 mavsim_sensor_bridge.egg-info/SOURCES.txt
 mavsim_sensor_bridge.egg-info/dependency_links.txt
