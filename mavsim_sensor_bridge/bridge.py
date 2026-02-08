@@ -7,7 +7,7 @@ for starting/stopping servers, registering callbacks, and managing configuration
 
 import asyncio
 import logging
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, List, Optional
 
 from mavsim_sensor_bridge.config import BridgeConfig
 from mavsim_sensor_bridge.servers.camera import CameraSensorServer
@@ -41,6 +41,8 @@ class SensorBridge:
         self._servers: Dict[str, CameraSensorServer] = {}
         self._is_running = False
         self._server_tasks: Dict[str, asyncio.Task] = {}
+        # Optional local ROS2 camera publisher (Task 2.5) - only this vessel's sensors
+        self._ros2_camera_publisher = None
         
         # Set up logging
         self.logger = logging.getLogger(f"{__name__}.SensorBridge")
@@ -99,6 +101,51 @@ class SensorBridge:
         self._servers['camera'].on_frame(vessel_id, camera_id, callback)
         self.logger.info(f"Registered camera callback for vessel_id={vessel_id}, camera_id={camera_id}")
     
+    def enable_ros2(
+        self,
+        controlled_vessel_id: int,
+        namespace: str,
+        vessel_name: str,
+        node_name: str = "mavsim_sensor_bridge",
+        camera_ids: Optional[List[int]] = None,
+    ) -> None:
+        """
+        Publish this vessel's camera frames to local ROS2 topics (Task 2.5).
+        
+        Only frames for the given controlled_vessel_id are published. Frames from
+        other vessels are not published. Call before start().
+        
+        Args:
+            controlled_vessel_id: Only publish frames for this vessel_id (int 0-255).
+            namespace: ROS namespace (e.g. 'sim_abc123').
+            vessel_name: Vessel name for topic (e.g. 'matsya_01' from config).
+            node_name: Name for the rclpy node.
+            camera_ids: Optional list of camera IDs from config; if provided, these
+                topics are pre-created at start. If None, publishers created on demand.
+        """
+        if 'camera' not in self._servers:
+            self.logger.warning("Cannot enable ROS2: camera server not enabled")
+            return
+        try:
+            from mavsim_sensor_bridge.ros2_publisher import LocalROS2CameraPublisher
+            self._ros2_camera_publisher = LocalROS2CameraPublisher(
+                controlled_vessel_id=controlled_vessel_id,
+                namespace=namespace,
+                vessel_name=vessel_name,
+                node_name=node_name,
+                camera_ids=camera_ids,
+            )
+            self._servers['camera'].set_global_frame_callback(
+                self._ros2_camera_publisher.publish_frame
+            )
+            self.logger.info(
+                "ROS2 local publish enabled for vessel_id=%s (namespace=%s, vessel=%s)",
+                controlled_vessel_id, namespace or "(default)", vessel_name,
+            )
+        except Exception as e:
+            self.logger.warning("ROS2 publish not available (rclpy missing?): %s", e)
+            self._ros2_camera_publisher = None
+    
     async def start(self) -> None:
         """
         Start all enabled sensor servers concurrently.
@@ -126,6 +173,15 @@ class SensorBridge:
             self.logger.info(f"Starting {sensor_type} server...")
             task = asyncio.create_task(server.start())
             self._server_tasks[sensor_type] = task
+        
+        # Start local ROS2 camera publisher if enabled (Task 2.5)
+        if self._ros2_camera_publisher is not None:
+            try:
+                self._ros2_camera_publisher.start()
+            except Exception as e:
+                self.logger.warning("Failed to start ROS2 camera publisher: %s", e)
+                self._ros2_camera_publisher = None
+                self._servers['camera'].set_global_frame_callback(None)
         
         # Give servers a moment to start and check for immediate startup errors
         await asyncio.sleep(0.1)
@@ -170,6 +226,16 @@ class SensorBridge:
         
         self.logger.info("Stopping SensorBridge...")
         self._is_running = False
+        
+        # Stop local ROS2 camera publisher (Task 2.5)
+        if self._ros2_camera_publisher is not None:
+            try:
+                self._ros2_camera_publisher.stop()
+            except Exception as e:
+                self.logger.debug("Error stopping ROS2 camera publisher: %s", e)
+            self._ros2_camera_publisher = None
+            if 'camera' in self._servers:
+                self._servers['camera'].set_global_frame_callback(None)
         
         # Stop all servers
         stop_tasks = []

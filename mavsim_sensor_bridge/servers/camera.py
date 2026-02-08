@@ -12,6 +12,9 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Dict, Optional, Tuple
 
+# Optional: callback invoked for every frame (e.g. for local ROS2 publish)
+FrameCallback = Callable[[int, int, float, bytes], None]
+
 from mavsim_sensor_bridge.servers.base import BaseSensorServer
 from mavsim_sensor_bridge.utils.binary import BinaryMessageError, unpack_camera_frame
 
@@ -72,6 +75,18 @@ class CameraSensorServer(BaseSensorServer):
         # Configuration
         self.max_timestamp_gap_seconds = 0.5  # Consider frames dropped if timestamp gap > 0.5s
         
+        # Optional global callback invoked for every frame (Task 2.5: e.g. local ROS2 publish)
+        self._global_frame_callback: Optional[FrameCallback] = None
+        self._global_callback_lock = threading.Lock()
+        
+        # Frame counters for debugging: check if any data is arriving on the WebSocket
+        self._frame_counts: Dict[Tuple[int, int], int] = {}
+        self._total_frames = 0
+        self._first_frame_logged: set = set()  # (vessel_id, camera_id) we've logged "first frame" for
+        self._stats_lock = threading.Lock()
+        # Log every N-th frame at DEBUG for ongoing activity (set to 0 to disable)
+        self._log_every_n_frames = 100
+        
         self.logger.info(f"CameraSensorServer initialized on port {port} (max_workers={max_workers})")
     
     def on_frame(
@@ -119,6 +134,20 @@ class CameraSensorServer(BaseSensorServer):
         
         self.logger.info(f"Registered callback for vessel_id={vessel_id}, camera_id={camera_id}")
     
+    def set_global_frame_callback(self, callback: Optional[FrameCallback]) -> None:
+        """
+        Set an optional callback invoked for every received frame (any vessel/camera).
+
+        Used by the bridge to publish to local ROS2 only for the controlled vessel.
+        Callback signature: callback(vessel_id, camera_id, timestamp, jpeg_data).
+        """
+        with self._global_callback_lock:
+            self._global_frame_callback = callback
+        if callback is not None:
+            self.logger.info("Global frame callback set (e.g. for local ROS2 publish)")
+        else:
+            self.logger.info("Global frame callback cleared")
+
     def remove_callback(self, vessel_id: int, camera_id: int) -> None:
         """
         Remove callback for a specific vessel and camera.
@@ -160,8 +189,26 @@ class CameraSensorServer(BaseSensorServer):
             # Unpack binary message
             vessel_id, camera_id, timestamp, jpeg_data = unpack_camera_frame(message)
             
-            # Check for frame drops (large timestamp gaps)
             key = (vessel_id, camera_id)
+            # Update frame counters for debugging (check if data is arriving on WebSocket)
+            with self._stats_lock:
+                self._frame_counts[key] = self._frame_counts.get(key, 0) + 1
+                self._total_frames += 1
+                count = self._frame_counts[key]
+            # Log first frame per stream at INFO so you can see "is any data coming in?"
+            if key not in self._first_frame_logged:
+                self._first_frame_logged.add(key)
+                self.logger.info(
+                    "Received camera frame: vessel_id=%s, camera_id=%s, size=%s bytes (first for this stream)",
+                    vessel_id, camera_id, len(jpeg_data),
+                )
+            elif self._log_every_n_frames and count % self._log_every_n_frames == 0:
+                self.logger.debug(
+                    "Camera frames: vessel_id=%s, camera_id=%s, total=%s",
+                    vessel_id, camera_id, count,
+                )
+            
+            # Check for frame drops (large timestamp gaps)
             with self._sequence_lock:
                 last_timestamp = self.last_timestamps.get(key, 0.0)
                 if last_timestamp > 0.0:
@@ -195,6 +242,21 @@ class CameraSensorServer(BaseSensorServer):
             else:
                 self.logger.debug(
                     f"No callback registered for vessel_id={vessel_id}, camera_id={camera_id}"
+                )
+            
+            # Optional global callback (e.g. local ROS2 publish for controlled vessel only)
+            with self._global_callback_lock:
+                global_cb = self._global_frame_callback
+            if global_cb:
+                loop = asyncio.get_event_loop()
+                loop.run_in_executor(
+                    self.executor,
+                    self._invoke_callback,
+                    global_cb,
+                    vessel_id,
+                    camera_id,
+                    timestamp,
+                    jpeg_data
                 )
         
         except BinaryMessageError as e:
@@ -232,6 +294,23 @@ class CameraSensorServer(BaseSensorServer):
                 exc_info=True
             )
     
+    def get_stats(self) -> dict:
+        """
+        Get current statistics including base (messages, bytes, connections) and
+        camera frame counts so you can check if any data is arriving on the WebSocket.
+        
+        Returns:
+            Dict with 'messages', 'bytes', 'connections', 'total_frames',
+            and 'frames_per_stream' (e.g. {"(1, 1)": 150, "(1, 2)": 0}).
+        """
+        base = super().get_stats()
+        with self._stats_lock:
+            frames_per_stream = {str(k): v for k, v in self._frame_counts.items()}
+            total = self._total_frames
+        base["total_frames"] = total
+        base["frames_per_stream"] = frames_per_stream
+        return base
+
     def get_dropped_frames(self, vessel_id: int, camera_id: int) -> int:
         """
         Get count of dropped frames for a specific vessel and camera.

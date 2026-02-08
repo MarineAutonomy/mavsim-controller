@@ -94,7 +94,7 @@ class BaseSensorServer(ABC):
             self.logger.info(f"Starting {self.name} server on port {self.port}")
             self._server = await websockets.serve(
                 self._handle_connection,
-                "0.0.0.0",  # Listen on all interfaces to accept connections from Docker containers
+                None,  # Listen on all interfaces (IPv4 + IPv6) to accept browser & Docker connections
                 self.port
             )
             self._is_running = True

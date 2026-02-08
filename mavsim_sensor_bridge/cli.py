@@ -124,12 +124,18 @@ class CLIBridgeRunner:
                     self.logger.info("Bridge Statistics Report")
                     self.logger.info("=" * 60)
                     for sensor_type, sensor_stats in stats.items():
-                        self.logger.info(
+                        line = (
                             f"{sensor_type}: "
                             f"{sensor_stats.get('messages', 0)} msgs, "
                             f"{sensor_stats.get('bytes', 0):,} bytes, "
                             f"{sensor_stats.get('connections', 0)} connections"
                         )
+                        if sensor_type == "camera" and "total_frames" in sensor_stats:
+                            line += (
+                                f", total_frames={sensor_stats.get('total_frames', 0)}"
+                                f", frames_per_stream={sensor_stats.get('frames_per_stream', {})}"
+                            )
+                        self.logger.info(line)
                     self.logger.info("=" * 60)
             except asyncio.CancelledError:
                 break
