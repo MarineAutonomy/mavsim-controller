@@ -41,6 +41,12 @@ class BaseSensorServer(ABC):
         _is_running (bool): Flag indicating if server is currently running
     """
     
+    # Maximum incoming WebSocket frame size in bytes.
+    # Subclasses may override this (e.g. LidarSensorServer sets a higher
+    # limit because a single 100K-point scan is ~1.6 MB).
+    # None means no limit.
+    _ws_max_size: int | None = None
+
     def __init__(self, port: int, name: str, log_level: int = logging.INFO):
         """
         Initialize the base sensor server.
@@ -95,7 +101,8 @@ class BaseSensorServer(ABC):
             self._server = await websockets.serve(
                 self._handle_connection,
                 None,  # Listen on all interfaces (IPv4 + IPv6) to accept browser & Docker connections
-                self.port
+                self.port,
+                max_size=self._ws_max_size,
             )
             self._is_running = True
             self.logger.info(f"{self.name} server started on port {self.port}")

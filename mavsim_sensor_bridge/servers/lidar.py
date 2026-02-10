@@ -42,6 +42,10 @@ class LidarSensorServer(BaseSensorServer):
         executor (ThreadPoolExecutor): Thread pool for callback execution
         max_points_per_scan (int): Maximum allowed points per scan (for validation)
     """
+
+    # Lidar scans can be large (e.g. 100K points × 4 floats × 4 bytes ≈ 1.6 MB).
+    # Remove the default WebSocket frame size limit so large scans are accepted.
+    _ws_max_size = None
     
     def __init__(
         self,
@@ -277,4 +281,5 @@ class LidarSensorServer(BaseSensorServer):
         self.logger.info("Shutting down thread pool executor...")
         self.executor.shutdown(wait=True)
         self.logger.info("Thread pool executor shut down")
+
 
