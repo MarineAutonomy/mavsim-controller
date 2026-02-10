@@ -38,6 +38,7 @@ class BridgeConfig:
         depth_port: Port for depth camera server (default: 8768)
         auxiliary_port: Port for auxiliary sensors (default: 8769)
         camera_enabled: Whether to enable camera server (default: True)
+        lidar_enabled: Whether to enable lidar server (default: True)
         log_level: Logging level (default: logging.INFO)
     """
     camera_port: int = DEFAULT_CAMERA_PORT
@@ -46,6 +47,7 @@ class BridgeConfig:
     depth_port: int = DEFAULT_DEPTH_PORT
     auxiliary_port: int = DEFAULT_AUXILIARY_PORT
     camera_enabled: bool = True
+    lidar_enabled: bool = True
     log_level: int = logging.INFO
 
     @classmethod
@@ -89,6 +91,7 @@ class BridgeConfig:
             SENSOR_BRIDGE_DEPTH_PORT: Depth camera server port (integer)
             SENSOR_BRIDGE_AUXILIARY_PORT: Auxiliary server port (integer)
             SENSOR_BRIDGE_CAMERA_ENABLED: "true" or "false"
+            SENSOR_BRIDGE_LIDAR_ENABLED: "true" or "false"
             SENSOR_BRIDGE_LOG_LEVEL: DEBUG, INFO, WARNING, ERROR
 
         Returns:
@@ -124,6 +127,7 @@ class BridgeConfig:
         config.depth_port = _int("SENSOR_BRIDGE_DEPTH_PORT", config.depth_port)
         config.auxiliary_port = _int("SENSOR_BRIDGE_AUXILIARY_PORT", config.auxiliary_port)
         config.camera_enabled = _bool("SENSOR_BRIDGE_CAMERA_ENABLED", config.camera_enabled)
+        config.lidar_enabled = _bool("SENSOR_BRIDGE_LIDAR_ENABLED", config.lidar_enabled)
         config.log_level = _log_level("SENSOR_BRIDGE_LOG_LEVEL", config.log_level)
         return config
 
@@ -132,7 +136,7 @@ class BridgeConfig:
         """Build BridgeConfig from a dictionary (used by from_yaml)."""
         valid = {
             "camera_port", "lidar_port", "sonar_port", "depth_port", "auxiliary_port",
-            "camera_enabled", "log_level",
+            "camera_enabled", "lidar_enabled", "log_level",
         }
         kwargs = {}
         for key, value in data.items():

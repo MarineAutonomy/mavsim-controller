@@ -9,8 +9,12 @@ import asyncio
 import logging
 from typing import Callable, Dict, List, Optional
 
+import numpy as np
+
 from mavsim_sensor_bridge.config import BridgeConfig
+from mavsim_sensor_bridge.servers.base import BaseSensorServer
 from mavsim_sensor_bridge.servers.camera import CameraSensorServer
+from mavsim_sensor_bridge.servers.lidar import LidarSensorServer
 
 
 class SensorBridge:
@@ -38,7 +42,7 @@ class SensorBridge:
             config: Optional BridgeConfig instance. If None, uses default config.
         """
         self.config = config or BridgeConfig()
-        self._servers: Dict[str, CameraSensorServer] = {}
+        self._servers: Dict[str, BaseSensorServer] = {}
         self._is_running = False
         self._server_tasks: Dict[str, asyncio.Task] = {}
         # Optional local ROS2 camera publisher (Task 2.5) - only this vessel's sensors
@@ -69,6 +73,12 @@ class SensorBridge:
                 log_level=self.config.log_level
             )
             self.logger.info(f"Camera server configured on port {self.config.camera_port}")
+        if self.config.lidar_enabled:
+            self._servers['lidar'] = LidarSensorServer(
+                port=self.config.lidar_port,
+                log_level=self.config.log_level
+            )
+            self.logger.info(f"Lidar server configured on port {self.config.lidar_port}")
     
     @property
     def is_running(self) -> bool:
@@ -100,7 +110,35 @@ class SensorBridge:
         
         self._servers['camera'].on_frame(vessel_id, camera_id, callback)
         self.logger.info(f"Registered camera callback for vessel_id={vessel_id}, camera_id={camera_id}")
-    
+
+    def on_lidar(
+        self,
+        vessel_id: int,
+        callback: Callable[[np.ndarray, float], None]
+    ) -> None:
+        """
+        Register a callback for lidar scans from a specific vessel.
+
+        The callback will be invoked whenever a lidar scan is received for
+        the specified vessel_id. Callback signature: callback(points, timestamp)
+        where points is a numpy array of shape (N, 4) with dtype float32
+        (x, y, z, intensity).
+
+        Args:
+            vessel_id: Vessel identifier (0-255)
+            callback: Callback function with signature: callback(points, timestamp)
+
+        Raises:
+            ValueError: If lidar server is not enabled
+        """
+        if 'lidar' not in self._servers:
+            raise ValueError("Lidar server is not enabled. Set lidar_enabled=True in config.")
+        # Type narrow for lidar server's on_scan
+        lidar_server = self._servers['lidar']
+        assert isinstance(lidar_server, LidarSensorServer)
+        lidar_server.on_scan(vessel_id, callback)
+        self.logger.info(f"Registered lidar callback for vessel_id={vessel_id}")
+
     def enable_ros2(
         self,
         controlled_vessel_id: int,
