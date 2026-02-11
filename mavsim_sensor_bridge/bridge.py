@@ -45,8 +45,9 @@ class SensorBridge:
         self._servers: Dict[str, BaseSensorServer] = {}
         self._is_running = False
         self._server_tasks: Dict[str, asyncio.Task] = {}
-        # Optional local ROS2 camera publisher (Task 2.5) - only this vessel's sensors
+        # Optional local ROS2 publishers (Task 2.5 + Phase 3) - only this vessel's sensors
         self._ros2_camera_publisher = None
+        self._ros2_lidar_publisher = None
         
         # Set up logging
         self.logger = logging.getLogger(f"{__name__}.SensorBridge")
@@ -146,43 +147,73 @@ class SensorBridge:
         vessel_name: str,
         node_name: str = "mavsim_sensor_bridge",
         camera_ids: Optional[List[int]] = None,
+        lidar_ids: Optional[List[int]] = None,
     ) -> None:
         """
-        Publish this vessel's camera frames to local ROS2 topics (Task 2.5).
+        Publish this vessel's sensor data to local ROS2 topics (Task 2.5 + Phase 3).
         
-        Only frames for the given controlled_vessel_id are published. Frames from
-        other vessels are not published. Call before start().
+        Only data for the given controlled_vessel_id is published. Data from
+        other vessels is not published. Call before start().
         
         Args:
-            controlled_vessel_id: Only publish frames for this vessel_id (int 0-255).
+            controlled_vessel_id: Only publish data for this vessel_id (int 0-255).
             namespace: ROS namespace (e.g. 'sim_abc123').
             vessel_name: Vessel name for topic (e.g. 'matsya_01' from config).
             node_name: Name for the rclpy node.
             camera_ids: Optional list of camera IDs from config; if provided, these
                 topics are pre-created at start. If None, publishers created on demand.
+            lidar_ids: Optional list of lidar sensor IDs from config; if provided, these
+                topics are pre-created at start. If None, publishers created on demand.
         """
-        if 'camera' not in self._servers:
-            self.logger.warning("Cannot enable ROS2: camera server not enabled")
-            return
-        try:
-            from mavsim_sensor_bridge.ros2_publisher import LocalROS2CameraPublisher
-            self._ros2_camera_publisher = LocalROS2CameraPublisher(
-                controlled_vessel_id=controlled_vessel_id,
-                namespace=namespace,
-                vessel_name=vessel_name,
-                node_name=node_name,
-                camera_ids=camera_ids,
-            )
-            self._servers['camera'].set_global_frame_callback(
-                self._ros2_camera_publisher.publish_frame
-            )
-            self.logger.info(
-                "ROS2 local publish enabled for vessel_id=%s (namespace=%s, vessel=%s)",
-                controlled_vessel_id, namespace or "(default)", vessel_name,
-            )
-        except Exception as e:
-            self.logger.warning("ROS2 publish not available (rclpy missing?): %s", e)
-            self._ros2_camera_publisher = None
+        # Camera ROS2 publisher
+        if 'camera' in self._servers:
+            try:
+                from mavsim_sensor_bridge.ros2_publisher import LocalROS2CameraPublisher
+                self._ros2_camera_publisher = LocalROS2CameraPublisher(
+                    controlled_vessel_id=controlled_vessel_id,
+                    namespace=namespace,
+                    vessel_name=vessel_name,
+                    node_name=node_name,
+                    camera_ids=camera_ids,
+                )
+                self._servers['camera'].set_global_frame_callback(
+                    self._ros2_camera_publisher.publish_frame
+                )
+                self.logger.info(
+                    "ROS2 camera publish enabled for vessel_id=%s (namespace=%s, vessel=%s)",
+                    controlled_vessel_id, namespace or "(default)", vessel_name,
+                )
+            except Exception as e:
+                self.logger.warning("ROS2 camera publish not available (rclpy missing?): %s", e)
+                self._ros2_camera_publisher = None
+        else:
+            self.logger.debug("Camera server not enabled, skipping ROS2 camera publisher")
+
+        # Lidar ROS2 publisher (Phase 3)
+        if 'lidar' in self._servers:
+            try:
+                from mavsim_sensor_bridge.ros2_publisher import LocalROS2LidarPublisher
+                self._ros2_lidar_publisher = LocalROS2LidarPublisher(
+                    controlled_vessel_id=controlled_vessel_id,
+                    namespace=namespace,
+                    vessel_name=vessel_name,
+                    lidar_ids=lidar_ids,
+                )
+                # Register a global callback on the lidar server that publishes to ROS2
+                lidar_server = self._servers['lidar']
+                assert isinstance(lidar_server, LidarSensorServer)
+                lidar_server.set_global_scan_callback(
+                    self._ros2_lidar_publisher.publish_scan
+                )
+                self.logger.info(
+                    "ROS2 lidar publish enabled for vessel_id=%s (namespace=%s, vessel=%s)",
+                    controlled_vessel_id, namespace or "(default)", vessel_name,
+                )
+            except Exception as e:
+                self.logger.warning("ROS2 lidar publish not available (rclpy missing?): %s", e)
+                self._ros2_lidar_publisher = None
+        else:
+            self.logger.debug("Lidar server not enabled, skipping ROS2 lidar publisher")
     
     async def start(self) -> None:
         """
@@ -220,6 +251,18 @@ class SensorBridge:
                 self.logger.warning("Failed to start ROS2 camera publisher: %s", e)
                 self._ros2_camera_publisher = None
                 self._servers['camera'].set_global_frame_callback(None)
+        
+        # Start local ROS2 lidar publisher if enabled (Phase 3)
+        if self._ros2_lidar_publisher is not None:
+            try:
+                self._ros2_lidar_publisher.start()
+            except Exception as e:
+                self.logger.warning("Failed to start ROS2 lidar publisher: %s", e)
+                self._ros2_lidar_publisher = None
+                if 'lidar' in self._servers:
+                    lidar_server = self._servers['lidar']
+                    assert isinstance(lidar_server, LidarSensorServer)
+                    lidar_server.set_global_scan_callback(None)
         
         # Give servers a moment to start and check for immediate startup errors
         await asyncio.sleep(0.1)
@@ -274,6 +317,18 @@ class SensorBridge:
             self._ros2_camera_publisher = None
             if 'camera' in self._servers:
                 self._servers['camera'].set_global_frame_callback(None)
+        
+        # Stop local ROS2 lidar publisher (Phase 3)
+        if self._ros2_lidar_publisher is not None:
+            try:
+                self._ros2_lidar_publisher.stop()
+            except Exception as e:
+                self.logger.debug("Error stopping ROS2 lidar publisher: %s", e)
+            self._ros2_lidar_publisher = None
+            if 'lidar' in self._servers:
+                lidar_server = self._servers['lidar']
+                assert isinstance(lidar_server, LidarSensorServer)
+                lidar_server.set_global_scan_callback(None)
         
         # Stop all servers
         stop_tasks = []

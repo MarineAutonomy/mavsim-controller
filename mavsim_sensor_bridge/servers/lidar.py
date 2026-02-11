@@ -75,6 +75,10 @@ class LidarSensorServer(BaseSensorServer):
         # Configuration
         self.max_points_per_scan = max_points_per_scan
         
+        # Optional global callback invoked for every scan (e.g. local ROS2 publish)
+        self._global_scan_callback: Optional[Callable] = None
+        self._global_callback_lock = threading.Lock()
+        
         # Scan counters for debugging: check if any data is arriving on the WebSocket
         self._scan_counts: Dict[int, int] = {}
         self._total_scans = 0
@@ -132,6 +136,23 @@ class LidarSensorServer(BaseSensorServer):
                 del self.callbacks[vessel_id]
                 self.logger.info(f"Removed callback for vessel_id={vessel_id}")
     
+    def set_global_scan_callback(self, callback: Optional[Callable]) -> None:
+        """
+        Set an optional callback invoked for every received scan (any vessel).
+
+        Used by the bridge to publish to local ROS2 only for the controlled vessel.
+        Callback signature: callback(vessel_id, points, timestamp).
+
+        Args:
+            callback: Callable or None to clear.
+        """
+        with self._global_callback_lock:
+            self._global_scan_callback = callback
+        if callback is not None:
+            self.logger.info("Global scan callback set (e.g. for local ROS2 publish)")
+        else:
+            self.logger.info("Global scan callback cleared")
+
     async def _process_message(self, message) -> None:
         """
         Process an incoming binary lidar scan message.
@@ -218,6 +239,20 @@ class LidarSensorServer(BaseSensorServer):
                 self.logger.debug(
                     f"No callback registered for vessel_id={vessel_id}"
                 )
+            
+            # Optional global callback (e.g. local ROS2 publish for controlled vessel only)
+            with self._global_callback_lock:
+                global_cb = self._global_scan_callback
+            if global_cb:
+                loop = asyncio.get_event_loop()
+                loop.run_in_executor(
+                    self.executor,
+                    self._invoke_global_callback,
+                    global_cb,
+                    vessel_id,
+                    points,
+                    timestamp
+                )
         
         except BinaryMessageError as e:
             self.logger.warning(f"Failed to unpack lidar scan: {e}")
@@ -247,6 +282,32 @@ class LidarSensorServer(BaseSensorServer):
             # Log error but don't crash the worker thread
             logging.getLogger(__name__).error(
                 f"Callback error for lidar scan: {e}",
+                exc_info=True
+            )
+    
+    @staticmethod
+    def _invoke_global_callback(
+        callback: Callable,
+        vessel_id: int,
+        points: np.ndarray,
+        timestamp: float
+    ) -> None:
+        """
+        Invoke global callback function with scan data (e.g. ROS2 publish).
+        
+        Passes vessel_id so the publisher can filter by controlled vessel.
+        
+        Args:
+            callback: Callback function to invoke
+            vessel_id: Vessel identifier
+            points: Point cloud array of shape (N, 4) with dtype float32
+            timestamp: Scan timestamp
+        """
+        try:
+            callback(vessel_id, points, timestamp)
+        except Exception as e:
+            logging.getLogger(__name__).error(
+                f"Global callback error for lidar scan: {e}",
                 exc_info=True
             )
     
