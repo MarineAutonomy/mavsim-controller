@@ -30,7 +30,7 @@ async def test_bridge_lidar():
     received = []
     config = BridgeConfig(camera_enabled=False, lidar_enabled=True, lidar_port=LIDAR_TEST_PORT)
     bridge = SensorBridge(config=config)
-    bridge.on_lidar(1, lambda points, ts: received.append(points))
+    bridge.on_lidar(1, lambda vid, lid, points, ts: received.append(points))
 
     # Start bridge in background (only lidar server will run)
     start_task = asyncio.create_task(bridge.start())
@@ -61,7 +61,7 @@ async def test_bridge_lidar_multiple_scans():
     received = []
     config = BridgeConfig(camera_enabled=False, lidar_enabled=True, lidar_port=LIDAR_TEST_PORT)
     bridge = SensorBridge(config=config)
-    bridge.on_lidar(1, lambda points, ts: received.append(points.shape[0]))
+    bridge.on_lidar(1, lambda vid, lid, points, ts: received.append(points.shape[0]))
 
     start_task = asyncio.create_task(bridge.start())
     await asyncio.sleep(0.5)
@@ -93,8 +93,8 @@ async def test_bridge_lidar_multiple_vessels():
     received_v2 = []
     config = BridgeConfig(camera_enabled=False, lidar_enabled=True, lidar_port=LIDAR_TEST_PORT)
     bridge = SensorBridge(config=config)
-    bridge.on_lidar(1, lambda points, ts: received_v1.append(points.shape[0]))
-    bridge.on_lidar(2, lambda points, ts: received_v2.append(points.shape[0]))
+    bridge.on_lidar(1, lambda vid, lid, points, ts: received_v1.append(points.shape[0]))
+    bridge.on_lidar(2, lambda vid, lid, points, ts: received_v2.append(points.shape[0]))
 
     start_task = asyncio.create_task(bridge.start())
     await asyncio.sleep(0.5)
@@ -123,7 +123,7 @@ def test_bridge_on_lidar_requires_lidar_enabled():
     bridge = SensorBridge(config=config)
 
     with pytest.raises(ValueError, match="Lidar server is not enabled"):
-        bridge.on_lidar(1, lambda points, ts: None)
+        bridge.on_lidar(1, lambda vid, lid, points, ts: None)
 
 
 def test_bridge_config_includes_lidar_port():
@@ -159,7 +159,7 @@ async def test_bridge_lidar_get_stats():
     """Test that get_server_stats includes lidar when lidar is enabled."""
     config = BridgeConfig(camera_enabled=False, lidar_enabled=True, lidar_port=LIDAR_TEST_PORT)
     bridge = SensorBridge(config=config)
-    bridge.on_lidar(1, lambda points, ts: None)
+    bridge.on_lidar(1, lambda vid, lid, points, ts: None)
 
     start_task = asyncio.create_task(bridge.start())
     await asyncio.sleep(0.5)

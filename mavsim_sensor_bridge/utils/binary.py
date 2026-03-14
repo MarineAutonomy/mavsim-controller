@@ -6,7 +6,7 @@ MAVSIM sensor bridge protocol specification.
 
 Message formats:
 - Camera Frame: vessel_id (uint8) + camera_id (uint8) + timestamp (float64) + JPEG data
-- Lidar Scan: vessel_id (uint8) + timestamp (float64) + point_count (uint32) + points (float32 × 4 × N)
+- Lidar Scan: vessel_id (uint8) + lidar_id (uint8) + timestamp (float64) + point_count (uint32) + points (float32 × 4 × N)
 - Sonar Image: vessel_id (uint8) + timestamp (float64) + beams (uint16) + range_bins (uint16) + intensity (uint8 × N)
 - Depth Camera: vessel_id (uint8) + timestamp (float64) + width (uint16) + height (uint16) + depth data (uint16 × N)
 """
@@ -18,7 +18,7 @@ import numpy as np
 
 # Message format constants
 CAMERA_HEADER_SIZE = 10  # 1 + 1 + 8 bytes (vessel_id + camera_id + timestamp)
-LIDAR_HEADER_SIZE = 13   # 1 + 8 + 4 bytes (vessel_id + timestamp + point_count)
+LIDAR_HEADER_SIZE = 14   # 1 + 1 + 8 + 4 bytes (vessel_id + lidar_id + timestamp + point_count)
 SONAR_HEADER_SIZE = 13   # 1 + 8 + 2 + 2 bytes (vessel_id + timestamp + beams + range_bins)
 DEPTH_HEADER_SIZE = 13   # 1 + 8 + 2 + 2 bytes (vessel_id + timestamp + width + height)
 
@@ -98,30 +98,34 @@ def unpack_camera_frame(data: bytes) -> Tuple[int, int, float, bytes]:
         raise BinaryMessageError(f"Failed to unpack camera frame: {e}") from e
 
 
-def pack_lidar_scan(vessel_id: int, timestamp: float, points: np.ndarray) -> bytes:
+def pack_lidar_scan(vessel_id: int, timestamp: float, points: np.ndarray, lidar_id: int = 0) -> bytes:
     """
     Pack a lidar scan into binary format.
     
     Format:
         Byte 0: vessel_id (uint8)
-        Bytes 1-8: timestamp (float64)
-        Bytes 9-12: point_count (uint32)
-        Bytes 13+: points (float32 × 4 × N) - each point is (x, y, z, intensity)
+        Byte 1: lidar_id (uint8)
+        Bytes 2-9: timestamp (float64)
+        Bytes 10-13: point_count (uint32)
+        Bytes 14+: points (float32 × 4 × N) - each point is (x, y, z, intensity)
     
     Args:
         vessel_id: Vessel identifier (0-255)
         timestamp: Timestamp in seconds (float64)
         points: NumPy array of shape (N, 4) with dtype float32, where each row is (x, y, z, intensity)
+        lidar_id: Lidar sensor identifier (0-255), default 0
     
     Returns:
         Packed binary message
     
     Raises:
-        BinaryMessageError: If vessel_id is out of range or points array is invalid
+        BinaryMessageError: If vessel_id or lidar_id is out of range or points array is invalid
         ValueError: If points array is empty or has wrong shape/dtype
     """
     if not (0 <= vessel_id <= 255):
         raise BinaryMessageError(f"vessel_id must be in range [0, 255], got {vessel_id}")
+    if not (0 <= lidar_id <= 255):
+        raise BinaryMessageError(f"lidar_id must be in range [0, 255], got {lidar_id}")
     
     # Ensure points is a numpy array first
     if not isinstance(points, np.ndarray):
@@ -140,8 +144,8 @@ def pack_lidar_scan(vessel_id: int, timestamp: float, points: np.ndarray) -> byt
     
     point_count = points.shape[0]
     
-    # Pack header: vessel_id (uint8), timestamp (float64), point_count (uint32)
-    header = struct.pack('>BdI', vessel_id, timestamp, point_count)
+    # Pack header: vessel_id (uint8), lidar_id (uint8), timestamp (float64), point_count (uint32)
+    header = struct.pack('>BBdI', vessel_id, lidar_id, timestamp, point_count)
     
     # Pack points as float32 array (big-endian)
     points_bytes = points.tobytes()
@@ -149,7 +153,7 @@ def pack_lidar_scan(vessel_id: int, timestamp: float, points: np.ndarray) -> byt
     return header + points_bytes
 
 
-def unpack_lidar_scan(data: bytes) -> Tuple[int, float, np.ndarray]:
+def unpack_lidar_scan(data: bytes) -> Tuple[int, int, float, np.ndarray]:
     """
     Unpack a lidar scan from binary format.
     
@@ -157,7 +161,8 @@ def unpack_lidar_scan(data: bytes) -> Tuple[int, float, np.ndarray]:
         data: Binary message data
     
     Returns:
-        Tuple of (vessel_id, timestamp, points) where points is numpy array of shape (N, 4) with dtype float32
+        Tuple of (vessel_id, lidar_id, timestamp, points) where points is
+        numpy array of shape (N, 4) with dtype float32
     
     Raises:
         BinaryMessageError: If data is too short or invalid format
@@ -169,7 +174,7 @@ def unpack_lidar_scan(data: bytes) -> Tuple[int, float, np.ndarray]:
     
     try:
         # Unpack header
-        vessel_id, timestamp, point_count = struct.unpack('>BdI', data[:LIDAR_HEADER_SIZE])
+        vessel_id, lidar_id, timestamp, point_count = struct.unpack('>BBdI', data[:LIDAR_HEADER_SIZE])
         
         # Calculate expected data size
         expected_size = LIDAR_HEADER_SIZE + point_count * 4 * 4  # 4 floats × 4 bytes each
@@ -182,7 +187,7 @@ def unpack_lidar_scan(data: bytes) -> Tuple[int, float, np.ndarray]:
         points_bytes = data[LIDAR_HEADER_SIZE:expected_size]
         points = np.frombuffer(points_bytes, dtype=np.float32).reshape(point_count, 4)
         
-        return int(vessel_id), float(timestamp), points
+        return int(vessel_id), int(lidar_id), float(timestamp), points
     
     except struct.error as e:
         raise BinaryMessageError(f"Failed to unpack lidar scan header: {e}") from e

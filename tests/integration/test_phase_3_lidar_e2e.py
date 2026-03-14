@@ -49,7 +49,7 @@ class ScanTracker:
         self.scans = []
         self.lock = threading.Lock()
 
-    def add_scan(self, points: np.ndarray, timestamp: float):
+    def add_scan(self, vessel_id: int, lidar_id: int, points: np.ndarray, timestamp: float):
         """Record a received scan."""
         with self.lock:
             self.scans.append({
@@ -322,7 +322,7 @@ async def test_lidar_bridge_stats():
     """Test that bridge stats are updated correctly after lidar streaming."""
 
     async def body(bridge):
-        bridge.on_lidar(1, lambda pts, ts: None)
+        bridge.on_lidar(1, lambda vid, lid, pts, ts: None)
 
         ws_url = f"ws://localhost:{LIDAR_PORT}"
         async with websockets.connect(ws_url) as ws:

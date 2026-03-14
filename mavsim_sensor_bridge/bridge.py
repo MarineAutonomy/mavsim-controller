@@ -115,30 +115,32 @@ class SensorBridge:
     def on_lidar(
         self,
         vessel_id: int,
-        callback: Callable[[np.ndarray, float], None]
+        callback: Callable[[int, int, np.ndarray, float], None],
+        lidar_id: int = 0,
     ) -> None:
         """
-        Register a callback for lidar scans from a specific vessel.
+        Register a callback for lidar scans from a specific vessel and lidar.
 
         The callback will be invoked whenever a lidar scan is received for
-        the specified vessel_id. Callback signature: callback(points, timestamp)
+        the specified (vessel_id, lidar_id).
+        Callback signature: callback(vessel_id, lidar_id, points, timestamp)
         where points is a numpy array of shape (N, 4) with dtype float32
         (x, y, z, intensity).
 
         Args:
             vessel_id: Vessel identifier (0-255)
-            callback: Callback function with signature: callback(points, timestamp)
+            callback: Callback function with signature:
+                callback(vessel_id, lidar_id, points, timestamp)
 
         Raises:
             ValueError: If lidar server is not enabled
         """
         if 'lidar' not in self._servers:
             raise ValueError("Lidar server is not enabled. Set lidar_enabled=True in config.")
-        # Type narrow for lidar server's on_scan
         lidar_server = self._servers['lidar']
         assert isinstance(lidar_server, LidarSensorServer)
-        lidar_server.on_scan(vessel_id, callback)
-        self.logger.info(f"Registered lidar callback for vessel_id={vessel_id}")
+        lidar_server.on_scan(vessel_id, callback, lidar_id=lidar_id)
+        self.logger.info(f"Registered lidar callback for vessel_id={vessel_id}, lidar_id={lidar_id}")
 
     def enable_ros2(
         self,

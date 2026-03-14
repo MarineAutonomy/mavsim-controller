@@ -140,9 +140,10 @@ def test_lidar_scan_roundtrip():
     points = np.random.randn(1000, 4).astype(np.float32)
     
     packed = pack_lidar_scan(vessel_id, timestamp, points)
-    unpacked_vessel_id, unpacked_timestamp, unpacked_points = unpack_lidar_scan(packed)
+    unpacked_vessel_id, unpacked_lidar_id, unpacked_timestamp, unpacked_points = unpack_lidar_scan(packed)
     
     assert unpacked_vessel_id == vessel_id
+    assert unpacked_lidar_id == 0  # default lidar_id
     assert abs(unpacked_timestamp - timestamp) < 1e-10
     assert unpacked_points.shape == points.shape
     assert unpacked_points.dtype == np.float32
@@ -173,7 +174,7 @@ def test_lidar_scan_dtype_conversion():
     points = np.random.randn(100, 4).astype(np.float64)  # float64 input
     
     packed = pack_lidar_scan(vessel_id, timestamp, points)
-    _, _, unpacked_points = unpack_lidar_scan(packed)
+    _, _, _, unpacked_points = unpack_lidar_scan(packed)
     
     assert unpacked_points.dtype == np.float32
 
@@ -185,7 +186,7 @@ def test_lidar_scan_list_input():
     points = [[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]]
     
     packed = pack_lidar_scan(vessel_id, timestamp, points)
-    _, _, unpacked_points = unpack_lidar_scan(packed)
+    _, _, _, unpacked_points = unpack_lidar_scan(packed)
     
     assert isinstance(unpacked_points, np.ndarray)
     assert unpacked_points.shape == (2, 4)
@@ -198,9 +199,10 @@ def test_lidar_scan_large_point_cloud():
     points = np.random.randn(100000, 4).astype(np.float32)
     
     packed = pack_lidar_scan(vessel_id, timestamp, points)
-    unpacked_vessel_id, unpacked_timestamp, unpacked_points = unpack_lidar_scan(packed)
+    unpacked_vessel_id, unpacked_lidar_id, unpacked_timestamp, unpacked_points = unpack_lidar_scan(packed)
     
     assert unpacked_vessel_id == vessel_id
+    assert unpacked_lidar_id == 0
     assert unpacked_points.shape == (100000, 4)
     assert np.allclose(points, unpacked_points)
 
@@ -478,10 +480,10 @@ def test_message_sizes_match_specification():
     camera_packed = pack_camera_frame(1, 1, 0.0, jpeg_data)
     assert len(camera_packed) == CAMERA_HEADER_SIZE + len(jpeg_data)
     
-    # Lidar: header should be 13 bytes
+    # Lidar: header should be 14 bytes
     points = np.random.randn(100, 4).astype(np.float32)
     lidar_packed = pack_lidar_scan(1, 0.0, points)
-    assert len(lidar_packed) == LIDAR_HEADER_SIZE + 100 * 4 * 4  # 13 + (100 points × 4 floats × 4 bytes)
+    assert len(lidar_packed) == LIDAR_HEADER_SIZE + 100 * 4 * 4  # 14 + (100 points × 4 floats × 4 bytes)
     
     # Sonar: header should be 17 bytes
     sonar_data = np.random.randint(0, 255, size=(10, 20), dtype=np.uint8)

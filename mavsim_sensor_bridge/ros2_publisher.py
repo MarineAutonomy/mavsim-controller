@@ -79,10 +79,11 @@ class LocalROS2CameraPublisher:
         self._log = logging.getLogger(f"{__name__}.LocalROS2CameraPublisher")
 
     def _topic_name(self, camera_id: int) -> str:
-        """Build topic name: /{namespace}/{vessel_name}/camera_{id:02d}/image/compressed"""
-        ns = self.namespace.strip("/")
-        if ns:
-            return f"/{ns}/{self.vessel_name}/camera_{camera_id:02d}/image/compressed"
+        """Build topic name: /{vessel_name}/camera_{id:02d}/image/compressed
+
+        Local container topics omit the simulation namespace since there's
+        only one session per Docker container.
+        """
         return f"/{self.vessel_name}/camera_{camera_id:02d}/image/compressed"
 
     def start(self) -> None:
@@ -245,10 +246,11 @@ class LocalROS2LidarPublisher:
         return fields
 
     def _topic_name(self, lidar_id: int) -> str:
-        """Build topic name: /{namespace}/{vessel_name}/lidar_{id:02d}/points"""
-        ns = self.namespace.strip("/")
-        if ns:
-            return f"/{ns}/{self.vessel_name}/lidar_{lidar_id:02d}/points"
+        """Build topic name: /{vessel_name}/lidar_{id:02d}/points
+
+        Local container topics omit the simulation namespace since there's
+        only one session per Docker container.
+        """
         return f"/{self.vessel_name}/lidar_{lidar_id:02d}/points"
 
     def start(self) -> None:
@@ -300,6 +302,7 @@ class LocalROS2LidarPublisher:
     def publish_scan(
         self,
         vessel_id: int,
+        lidar_id: int,
         points: np.ndarray,
         timestamp: float,
     ) -> None:
@@ -308,6 +311,7 @@ class LocalROS2LidarPublisher:
 
         Args:
             vessel_id: Vessel that produced the scan (int 0-255).
+            lidar_id: Lidar sensor identifier (int 0-255).
             points: Nx4 float32 array with columns [x, y, z, intensity].
             timestamp: Unix timestamp in seconds (float).
         """
@@ -316,8 +320,7 @@ class LocalROS2LidarPublisher:
         if vessel_id != self.controlled_vessel_id:
             return
         try:
-            # Use lidar_id=1 by default (single lidar per vessel for now)
-            pub = self._get_publisher(1)
+            pub = self._get_publisher(lidar_id)
 
             sec = int(timestamp)
             nsec = int((timestamp - sec) * 1e9)

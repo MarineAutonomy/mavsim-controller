@@ -25,7 +25,7 @@ async def test_lidar_server_receives_scan():
     """Test that server receives scans and invokes callbacks correctly."""
     received = []
     
-    def callback(points, timestamp):
+    def callback(vessel_id, lidar_id, points, timestamp):
         received.append((points, timestamp))
     
     server = LidarSensorServer(port=18766)
@@ -61,7 +61,7 @@ async def test_lidar_server_high_throughput():
     """Test 10 scans/sec for 2 seconds (20 scans total)."""
     count = [0]  # Use list to allow modification from callback
     
-    def callback(points, timestamp):
+    def callback(vessel_id, lidar_id, points, timestamp):
         count[0] += 1
     
     server = LidarSensorServer(port=18766, max_workers=8)
@@ -100,10 +100,10 @@ async def test_lidar_server_multiple_vessels():
     received_v1 = []
     received_v2 = []
     
-    def callback_v1(points, timestamp):
+    def callback_v1(vessel_id, lidar_id, points, timestamp):
         received_v1.append(points.shape[0])
     
-    def callback_v2(points, timestamp):
+    def callback_v2(vessel_id, lidar_id, points, timestamp):
         received_v2.append(points.shape[0])
     
     server = LidarSensorServer(port=18766)
@@ -199,7 +199,7 @@ async def test_lidar_server_point_count_validation():
     """Test point count validation."""
     received = []
     
-    def callback(points, timestamp):
+    def callback(vessel_id, lidar_id, points, timestamp):
         received.append(points.shape[0])
     
     server = LidarSensorServer(port=18766, max_points_per_scan=1000)
@@ -235,7 +235,7 @@ async def test_lidar_server_empty_scan():
     """Test server handles empty scans gracefully."""
     received = []
     
-    def callback(points, timestamp):
+    def callback(vessel_id, lidar_id, points, timestamp):
         received.append(points)
     
     server = LidarSensorServer(port=18766)
@@ -274,7 +274,7 @@ async def test_lidar_server_callback_error_handling():
     """Test that callback errors don't crash the server."""
     call_count = [0]
     
-    def callback_with_error(points, timestamp):
+    def callback_with_error(vessel_id, lidar_id, points, timestamp):
         call_count[0] += 1
         if call_count[0] == 1:
             raise ValueError("Test error")
@@ -330,7 +330,7 @@ def test_lidar_server_remove_callback():
     """Test removing callbacks."""
     server = LidarSensorServer(port=18766)
     
-    def callback(points, timestamp):
+    def callback(vessel_id, lidar_id, points, timestamp):
         pass
     
     # Register callback
@@ -349,7 +349,7 @@ async def test_lidar_server_thread_pool_execution():
     callback_thread_ids = []
     callback_lock = threading.Lock()
     
-    def callback(points, timestamp):
+    def callback(vessel_id, lidar_id, points, timestamp):
         thread_id = threading.current_thread().ident
         with callback_lock:
             callback_thread_ids.append(thread_id)
@@ -440,7 +440,7 @@ async def test_lidar_server_various_point_counts():
     received_counts = []
     callback_lock = threading.Lock()
     
-    def callback(points, timestamp):
+    def callback(vessel_id, lidar_id, points, timestamp):
         with callback_lock:
             received_counts.append(points.shape[0])
     

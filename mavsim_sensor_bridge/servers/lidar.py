@@ -9,15 +9,15 @@ import asyncio
 import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, Optional, Tuple
 
 import numpy as np
 
 from mavsim_sensor_bridge.servers.base import BaseSensorServer
 from mavsim_sensor_bridge.utils.binary import BinaryMessageError, unpack_lidar_scan
 
-# Callback signature: callback(points, timestamp) where points is numpy array (N, 4) with dtype float32
-ScanCallback = Callable[[np.ndarray, float], None]
+# Callback signature: callback(vessel_id, lidar_id, points, timestamp)
+ScanCallback = Callable[[int, int, np.ndarray, float], None]
 
 
 class LidarSensorServer(BaseSensorServer):
@@ -29,8 +29,8 @@ class LidarSensorServer(BaseSensorServer):
     in a thread pool to avoid blocking the async event loop.
     
     Features:
-    - Binary message unpacking (vessel_id, timestamp, point cloud)
-    - Callback registration per vessel_id
+    - Binary message unpacking (vessel_id, lidar_id, timestamp, point cloud)
+    - Callback registration per (vessel_id, lidar_id)
     - Thread pool for non-blocking callback execution
     - Point count validation
     - Support for 3D point format (x, y, z, intensity) as Float32
@@ -38,7 +38,7 @@ class LidarSensorServer(BaseSensorServer):
     Attributes:
         port (int): Port number for the WebSocket server
         name (str): Name identifier ("LidarSensorServer")
-        callbacks (Dict[int, Callable]): Registered callbacks keyed by vessel_id
+        callbacks (Dict[Tuple[int, int], Callable]): Registered callbacks keyed by (vessel_id, lidar_id)
         executor (ThreadPoolExecutor): Thread pool for callback execution
         max_points_per_scan (int): Maximum allowed points per scan (for validation)
     """
@@ -65,8 +65,8 @@ class LidarSensorServer(BaseSensorServer):
         """
         super().__init__(port=port, name="LidarSensorServer", log_level=log_level)
         
-        # Callback registry: vessel_id -> callback function
-        self.callbacks: Dict[int, Callable] = {}
+        # Callback registry: (vessel_id, lidar_id) -> callback function
+        self.callbacks: Dict[Tuple[int, int], Callable] = {}
         self._callbacks_lock = threading.Lock()
         
         # Thread pool for callback execution
@@ -80,9 +80,9 @@ class LidarSensorServer(BaseSensorServer):
         self._global_callback_lock = threading.Lock()
         
         # Scan counters for debugging: check if any data is arriving on the WebSocket
-        self._scan_counts: Dict[int, int] = {}
+        self._scan_counts: Dict[Tuple[int, int], int] = {}
         self._total_scans = 0
-        self._first_scan_logged: set = set()  # vessel_ids we've logged "first scan" for
+        self._first_scan_logged: set = set()  # (vessel_id, lidar_id) tuples logged
         self._stats_lock = threading.Lock()
         # Log every N-th scan at DEBUG for ongoing activity (set to 0 to disable)
         self._log_every_n_scans = 100
@@ -92,49 +92,55 @@ class LidarSensorServer(BaseSensorServer):
     def on_scan(
         self,
         vessel_id: int,
-        callback: Callable[[np.ndarray, float], None]
+        callback: Callable[[int, int, np.ndarray, float], None],
+        lidar_id: int = 0,
     ) -> None:
         """
-        Register a callback for lidar scans from a specific vessel.
+        Register a callback for lidar scans from a specific vessel and lidar.
         
         The callback will be invoked in a thread pool (non-blocking) whenever
-        a scan is received for the specified vessel_id.
+        a scan is received for the specified (vessel_id, lidar_id).
         
         Args:
             vessel_id: Vessel identifier (0-255)
-            callback: Callback function with signature: callback(points, timestamp)
-                     where points is numpy array of shape (N, 4) with dtype float32,
-                     each row is (x, y, z, intensity).
-                     This will be called from a worker thread, so it should be thread-safe.
+            callback: Callback function with signature:
+                callback(vessel_id, lidar_id, points, timestamp)
+                where points is numpy array of shape (N, 4) with dtype float32,
+                each row is (x, y, z, intensity).
+                This will be called from a worker thread, so it should be thread-safe.
+            lidar_id: Lidar sensor identifier (0-255), default 0
         
         Example:
-            def handle_scan(points, timestamp):
-                print(f"Received scan with {len(points)} points")
-                # Process point cloud...
+            def handle_scan(vessel_id, lidar_id, points, timestamp):
+                print(f"Vessel {vessel_id} lidar {lidar_id}: {len(points)} points")
             
-            server.on_scan(vessel_id=1, callback=handle_scan)
+            server.on_scan(vessel_id=1, callback=handle_scan, lidar_id=0)
         """
         if not (0 <= vessel_id <= 255):
             raise ValueError(f"vessel_id must be in range [0, 255], got {vessel_id}")
+        if not (0 <= lidar_id <= 255):
+            raise ValueError(f"lidar_id must be in range [0, 255], got {lidar_id}")
         if not callable(callback):
             raise TypeError("callback must be callable")
         
         with self._callbacks_lock:
-            self.callbacks[vessel_id] = callback
+            self.callbacks[(vessel_id, lidar_id)] = callback
         
-        self.logger.info(f"Registered callback for vessel_id={vessel_id}")
+        self.logger.info(f"Registered callback for vessel_id={vessel_id}, lidar_id={lidar_id}")
     
-    def remove_callback(self, vessel_id: int) -> None:
+    def remove_callback(self, vessel_id: int, lidar_id: int = 0) -> None:
         """
-        Remove callback for a specific vessel.
+        Remove callback for a specific vessel and lidar.
         
         Args:
             vessel_id: Vessel identifier
+            lidar_id: Lidar sensor identifier
         """
+        key = (vessel_id, lidar_id)
         with self._callbacks_lock:
-            if vessel_id in self.callbacks:
-                del self.callbacks[vessel_id]
-                self.logger.info(f"Removed callback for vessel_id={vessel_id}")
+            if key in self.callbacks:
+                del self.callbacks[key]
+                self.logger.info(f"Removed callback for vessel_id={vessel_id}, lidar_id={lidar_id}")
     
     def set_global_scan_callback(self, callback: Optional[Callable]) -> None:
         """
@@ -171,18 +177,18 @@ class LidarSensorServer(BaseSensorServer):
         
         try:
             # Unpack binary message
-            vessel_id, timestamp, points = unpack_lidar_scan(message)
+            vessel_id, lidar_id, timestamp, points = unpack_lidar_scan(message)
             
             # Validate point count
             point_count = points.shape[0]
             if point_count == 0:
-                self.logger.warning(f"Received empty point cloud for vessel_id={vessel_id}")
+                self.logger.warning(f"Received empty point cloud for vessel_id={vessel_id}, lidar_id={lidar_id}")
                 return
             
             if point_count > self.max_points_per_scan:
                 self.logger.warning(
                     f"Point count {point_count} exceeds maximum {self.max_points_per_scan} "
-                    f"for vessel_id={vessel_id}, truncating scan"
+                    f"for vessel_id={vessel_id}, lidar_id={lidar_id}, truncating scan"
                 )
                 points = points[:self.max_points_per_scan]
             
@@ -190,54 +196,55 @@ class LidarSensorServer(BaseSensorServer):
             if points.shape[1] != 4:
                 self.logger.warning(
                     f"Invalid point format: expected shape (N, 4), got {points.shape} "
-                    f"for vessel_id={vessel_id}"
+                    f"for vessel_id={vessel_id}, lidar_id={lidar_id}"
                 )
                 return
             
             if points.dtype != np.float32:
                 self.logger.warning(
                     f"Invalid point dtype: expected float32, got {points.dtype} "
-                    f"for vessel_id={vessel_id}, converting"
+                    f"for vessel_id={vessel_id}, lidar_id={lidar_id}, converting"
                 )
                 points = points.astype(np.float32)
             
             # Update scan counters for debugging
+            key = (vessel_id, lidar_id)
             with self._stats_lock:
-                self._scan_counts[vessel_id] = self._scan_counts.get(vessel_id, 0) + 1
+                self._scan_counts[key] = self._scan_counts.get(key, 0) + 1
                 self._total_scans += 1
-                count = self._scan_counts[vessel_id]
+                count = self._scan_counts[key]
             
-            # Log first scan per vessel at INFO so you can see "is any data coming in?"
-            if vessel_id not in self._first_scan_logged:
-                self._first_scan_logged.add(vessel_id)
+            # Log first scan per (vessel, lidar) at INFO
+            if key not in self._first_scan_logged:
+                self._first_scan_logged.add(key)
                 self.logger.info(
-                    "Received lidar scan: vessel_id=%s, points=%s, size=%s bytes (first for this vessel)",
-                    vessel_id, point_count, len(message),
+                    "Received lidar scan: vessel_id=%s, lidar_id=%s, points=%s, size=%s bytes (first for this sensor)",
+                    vessel_id, lidar_id, point_count, len(message),
                 )
             elif self._log_every_n_scans and count % self._log_every_n_scans == 0:
                 self.logger.debug(
-                    "Lidar scans: vessel_id=%s, points=%s, total=%s",
-                    vessel_id, point_count, count,
+                    "Lidar scans: vessel_id=%s, lidar_id=%s, points=%s, total=%s",
+                    vessel_id, lidar_id, point_count, count,
                 )
             
-            # Find callback for this vessel_id
+            # Find callback for this (vessel_id, lidar_id)
             with self._callbacks_lock:
-                callback = self.callbacks.get(vessel_id)
+                callback = self.callbacks.get(key)
             
             if callback:
-                # Execute callback in thread pool (non-blocking)
-                # Use run_in_executor to avoid blocking the event loop
                 loop = asyncio.get_event_loop()
                 loop.run_in_executor(
                     self.executor,
                     self._invoke_callback,
                     callback,
+                    vessel_id,
+                    lidar_id,
                     points,
                     timestamp
                 )
             else:
                 self.logger.debug(
-                    f"No callback registered for vessel_id={vessel_id}"
+                    f"No callback registered for vessel_id={vessel_id}, lidar_id={lidar_id}"
                 )
             
             # Optional global callback (e.g. local ROS2 publish for controlled vessel only)
@@ -250,6 +257,7 @@ class LidarSensorServer(BaseSensorServer):
                     self._invoke_global_callback,
                     global_cb,
                     vessel_id,
+                    lidar_id,
                     points,
                     timestamp
                 )
@@ -262,6 +270,8 @@ class LidarSensorServer(BaseSensorServer):
     @staticmethod
     def _invoke_callback(
         callback: Callable,
+        vessel_id: int,
+        lidar_id: int,
         points: np.ndarray,
         timestamp: float
     ) -> None:
@@ -273,13 +283,14 @@ class LidarSensorServer(BaseSensorServer):
         
         Args:
             callback: Callback function to invoke
+            vessel_id: Vessel identifier
+            lidar_id: Lidar sensor identifier
             points: Point cloud array of shape (N, 4) with dtype float32
             timestamp: Scan timestamp
         """
         try:
-            callback(points, timestamp)
+            callback(vessel_id, lidar_id, points, timestamp)
         except Exception as e:
-            # Log error but don't crash the worker thread
             logging.getLogger(__name__).error(
                 f"Callback error for lidar scan: {e}",
                 exc_info=True
@@ -289,22 +300,24 @@ class LidarSensorServer(BaseSensorServer):
     def _invoke_global_callback(
         callback: Callable,
         vessel_id: int,
+        lidar_id: int,
         points: np.ndarray,
         timestamp: float
     ) -> None:
         """
         Invoke global callback function with scan data (e.g. ROS2 publish).
         
-        Passes vessel_id so the publisher can filter by controlled vessel.
+        Passes vessel_id and lidar_id so the publisher can filter and route.
         
         Args:
             callback: Callback function to invoke
             vessel_id: Vessel identifier
+            lidar_id: Lidar sensor identifier
             points: Point cloud array of shape (N, 4) with dtype float32
             timestamp: Scan timestamp
         """
         try:
-            callback(vessel_id, points, timestamp)
+            callback(vessel_id, lidar_id, points, timestamp)
         except Exception as e:
             logging.getLogger(__name__).error(
                 f"Global callback error for lidar scan: {e}",
@@ -322,10 +335,12 @@ class LidarSensorServer(BaseSensorServer):
         """
         base = super().get_stats()
         with self._stats_lock:
-            scans_per_vessel = {str(k): v for k, v in self._scan_counts.items()}
+            scans_per_sensor = {
+                f"{vid}:{lid}": v for (vid, lid), v in self._scan_counts.items()
+            }
             total = self._total_scans
         base["total_scans"] = total
-        base["scans_per_vessel"] = scans_per_vessel
+        base["scans_per_sensor"] = scans_per_sensor
         return base
     
     async def stop(self) -> None:
