@@ -1,0 +1,9 @@
+# Recorded bags are runtime artifacts
+recordings/*
+!recordings/.gitkeep
+
+# Downloaded tokens may contain session credentials
+*token*.json
+
+__pycache__/
+*.pyc
