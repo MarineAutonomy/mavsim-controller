@@ -515,7 +515,7 @@ _FRONTEND_HTML = """<!DOCTYPE html>
       <label for="rosDomainId">ROS_DOMAIN_ID</label>
       <input type="number" id="rosDomainId" placeholder="container default" min="0" max="232">
       <div class="toggle-row">
-        <span class="lbl">Enable Sensors<br><span class="hint">camera / lidar / imu topics</span></span>
+        <span class="lbl">Enable Sensors<br><span class="hint">camera / lidar / imu topics &mdash; required if you want them in the recorded bag</span></span>
         <label class="toggle"><input type="checkbox" id="enableSensors"><span class="slider"></span></label>
       </div>
       <div class="toggle-row">
