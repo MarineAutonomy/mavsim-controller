@@ -21,11 +21,17 @@
 # The bridge forwards the latest command to the simulator over REST.
 #
 # Modes:
-#   CLI mode (default): ./start.sh <controller-code> [options...]
-#   Token mode:         ./start.sh --token /path/to/token.json [options...]
-#   Web mode:           ./start.sh --mode web [options...]
+#   Web mode (default - no arguments at all): ./start.sh
+#     Starts a local web UI to start/stop sessions from a browser - the
+#     easiest way to run this if you don't already have a controller-code
+#     or token file in hand. Passing ANY argument (a controller-code,
+#     --token, or an explicit --mode) opts back into CLI/token mode below.
+#   CLI mode:   ./start.sh <controller-code> [options...]
+#   Token mode: ./start.sh --token /path/to/token.json [options...]
+#   Web mode (explicit): ./start.sh --mode web [options...]
 #
 # Usage:
+#   ./start.sh
 #   ./start.sh <controller-code> [--vessel-name NAME] [--backend-url URL]
 #              [--frontend-url URL] [--rate HZ] [--ros-domain-id N]
 #              [--cmd-timeout SEC] [--observe-others]
@@ -33,12 +39,22 @@
 #   ./start.sh --mode web [--port 8888] [--backend-url URL] [--frontend-url URL] [--ros-domain-id N]
 #
 # Examples:
+#   ./start.sh                      # web mode, no controller-code/token needed upfront
 #   ./start.sh ABC123
 #   ./start.sh ABC123 --observe-others
 #   ./start.sh ABC123 --frontend-url http://my-server:5173
 #   ./start.sh --token ./mavsim_token_abc12345.json --observe-others
 #   ./start.sh --mode web
 #   ./start.sh ABC123 --ros-domain-id 43   # run a second bridge alongside this one
+#
+# By default the image is pulled (mavlab/mavsim-controller:latest) rather
+# than built locally - core/*.py (base_controller.py, observer.py, etc.) are
+# bind-mounted from this checkout on top of it either way, so routine code
+# changes there take effect on the next run with no rebuild needed. Pass
+# --build (or set BUILD_LOCAL=1) to build the image locally instead, only
+# needed if you've changed the Dockerfile itself (new OS dependency, ROS2/
+# Python version bump):
+#   ./start.sh --build ABC123
 #
 # --ros-domain-id defaults to 42 (not 0) on every run, including local Docker
 # testing against a `docker compose` mavsim stack - see the comment by
@@ -53,6 +69,7 @@ DOCKER_IMAGE="mavlab/mavsim-controller:latest"
 CONTAINER_NAME="mavsim-bridge-$$"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 DEFAULT_BACKEND_URL="http://localhost:5000"
 DEFAULT_FRONTEND_URL="http://localhost:5173"
@@ -73,6 +90,14 @@ DEFAULT_CMD_TIMEOUT=1.0
 RECORDINGS_DIR="$SCRIPT_DIR/recordings"
 BRIDGE_FILE="$SCRIPT_DIR/bridge_controller.py"
 WEBAPP_FILE="$SCRIPT_DIR/bridge_webapp.py"
+# Bridge core infrastructure (base_controller.py, python_controller.py, etc.)
+# - bind-mounted into the container below on top of the image's own baked-in
+# copies, so editing any of these locally takes effect on the next container
+# start with no `docker build` needed.
+CORE_DIR="$SCRIPT_DIR/core"
+CORE_FILES=(base_controller.py python_controller.py run_controller.py \
+            recording_service.py local_sensor_generator.py observer.py \
+            visualizer_server.py)
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -83,8 +108,43 @@ print_info()  { echo -e "${GREEN}[INFO]${NC} $1"; }
 print_warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
 print_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 
+# ---- Opt-in local build (default is docker pull) ----
+# Scanned and stripped out of "$@" here, before mode detection below - so
+# `--build` can appear anywhere (including as the *only* argument, which
+# must still mean "web mode + build locally", not "one argument present,
+# so fall through to CLI mode"). For maintainers who've changed the
+# Dockerfile itself (new OS dependency, ROS2/Python version bump) -
+# bind-mounting core/ (below) only covers application code, not
+# image-level setup, so a real rebuild is sometimes still necessary.
+# Everyone else keeps getting the published image.
+if [ "${BUILD_LOCAL:-0}" = "1" ]; then
+    BUILD_LOCAL=true
+else
+    BUILD_LOCAL=false
+fi
+ARGS=()
+for arg in "$@"; do
+    if [ "$arg" = "--build" ]; then
+        BUILD_LOCAL=true
+    else
+        ARGS+=("$arg")
+    fi
+done
+set -- "${ARGS[@]}"
+
 # ---- Detect mode ----
-MODE="cli"
+# No arguments at all defaults to web mode - the friendliest entry point for
+# a user who doesn't want to get a controller-code/token right upfront: it
+# starts a local web UI (see $DEFAULT_WEBAPP_PORT below) to start/stop
+# sessions from a browser instead. Passing anything at all - a
+# controller-code, --token, or an explicit --mode - opts back into
+# CLI/token mode exactly as before; this only changes the *no-argument*
+# case, which previously just errored out asking for one.
+if [ $# -eq 0 ]; then
+    MODE="web"
+else
+    MODE="cli"
+fi
 WEBAPP_PORT="$DEFAULT_WEBAPP_PORT"
 ROS_DOMAIN_ID_VAL="$DEFAULT_ROS_DOMAIN_ID"
 
@@ -108,8 +168,19 @@ if [ ! -f "$BRIDGE_FILE" ]; then
     exit 1
 fi
 
-# Pull image if not present locally
-if ! docker image inspect "$DOCKER_IMAGE" &>/dev/null; then
+for f in "${CORE_FILES[@]}"; do
+    if [ ! -f "$CORE_DIR/$f" ]; then
+        print_error "$f not found under $CORE_DIR"
+        print_error "Re-clone user_repo_new or restore user_repo_new/core/."
+        exit 1
+    fi
+done
+
+# Build locally (--build/BUILD_LOCAL=1) or pull if not present locally
+if [ "$BUILD_LOCAL" = true ]; then
+    print_info "Building $DOCKER_IMAGE locally from $SCRIPT_DIR/Dockerfile (--build requested)..."
+    docker build -f "$SCRIPT_DIR/Dockerfile" -t "$DOCKER_IMAGE" "$REPO_ROOT" || { print_error "Build failed"; exit 1; }
+elif ! docker image inspect "$DOCKER_IMAGE" &>/dev/null; then
     print_info "Pulling $DOCKER_IMAGE ..."
     docker pull "$DOCKER_IMAGE" || { print_error "Failed to pull image"; exit 1; }
 fi
@@ -136,7 +207,7 @@ rewrite_url() {
 # The headless sensor observer defaults to CPU-only SwiftShader rendering,
 # which can become unresponsive under real load (multiple vessels/sensors,
 # heavy post-processing). When a real GPU is available, request passthrough
-# so the observer can use it instead - examples/observer.py independently
+# so the observer can use it instead - core/observer.py independently
 # re-checks GPU access from inside the container before picking Chromium's
 # render flags, so a false positive here just falls back to SwiftShader
 # rather than breaking anything. Detection has to happen here (not inside
@@ -215,6 +286,11 @@ if [ "$MODE" = "web" ]; then
         -v "$RECORDINGS_DIR:/tmp/mavsim_bags"
         -v "$BRIDGE_FILE:/app/user_code/my_controller.py:ro"
         -v "$WEBAPP_FILE:/app/user_code/bridge_webapp.py:ro"
+    )
+    for f in "${CORE_FILES[@]}"; do
+        DOCKER_ARGS+=(-v "$CORE_DIR/$f:/app/$f:ro")
+    done
+    DOCKER_ARGS+=(
         --entrypoint /bin/bash
         "$DOCKER_IMAGE"
         -c "$WEB_CMD"
@@ -244,6 +320,7 @@ fi
 
 if [ -z "$TOKEN_FILE" ] && [ $# -lt 1 ]; then
     print_error "Controller code or --token is required in CLI mode"
+    print_error "(tip: run $0 with no arguments at all for web mode instead)"
     echo ""
     echo "Usage:"
     echo "  $0 <controller-code> [--vessel-name NAME] [--backend-url URL] [--frontend-url URL] [--rate HZ] [--ros-domain-id N] [--cmd-timeout SEC] [--observe-others]"
@@ -340,6 +417,9 @@ DOCKER_ARGS+=(
     -v "$RECORDINGS_DIR:/tmp/mavsim_bags"
     -v "$BRIDGE_FILE:/app/user_code/my_controller.py:ro"
 )
+for f in "${CORE_FILES[@]}"; do
+    DOCKER_ARGS+=(-v "$CORE_DIR/$f:/app/$f:ro")
+done
 
 if [ -n "$TOKEN_FILE" ]; then
     DOCKER_ARGS+=(

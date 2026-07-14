@@ -62,7 +62,13 @@ already on the local ROS2 graph.
 ## Quick start (Linux)
 
 ```bash
-# 1. Get a controller code from the mavsim simulation UI, then start the bridge:
+# 0. Don't have a controller code or token handy yet? Just run:
+./start.sh
+# ...with no arguments at all - this opens web mode (http://localhost:8888),
+# where you can enter a code/token and start the bridge from a browser.
+
+# 1. Or, if you already have a controller code from the mavsim simulation UI,
+#    start the bridge directly from the terminal instead:
 ./start.sh ABC123
 
 # 2. In another terminal, run your controller against the local ROS2 topics.
@@ -75,6 +81,14 @@ python3 examples/python_ros2/example_controller.py --vessel matsya_01 --cs cs_01
 Both must share the same `ROS_DOMAIN_ID` and be on the same machine (the bridge
 uses `--network host` on Linux). To run your code in its own container instead,
 see [`examples/docker/`](examples/docker/).
+
+**GPU acceleration**: if an NVIDIA GPU is available (via Docker's
+nvidia-container-toolkit on Linux, or Docker Desktop's WSL2 backend with the
+NVIDIA driver for WSL on Windows), `start.sh`/`start.bat` detect it
+automatically and pass it through (`--gpus all`) so the headless sensor
+observer renders camera/lidar with real hardware acceleration instead of
+CPU-only SwiftShader. No flag needed either way - check the `GPU:` line in
+the startup output to see which one was picked.
 
 ## Files
 
@@ -94,14 +108,21 @@ see [`examples/docker/`](examples/docker/).
 ## Options
 
 ```
+Web mode (default - no arguments at all):
+  ./start.sh
+
 CLI / token mode:
   ./start.sh <code> [--vessel-name NAME] [--backend-url URL] [--frontend-url URL]
              [--rate HZ] [--ros-domain-id N] [--cmd-timeout SEC] [--observe-others]
   ./start.sh --token /path/to/token.json [same options]
 
-Web mode:
+Web mode (explicit):
   ./start.sh --mode web [--port 8888] [--backend-url URL] [--frontend-url URL] [--ros-domain-id N]
 ```
+
+Running with no arguments at all (`./start.sh` / `start.bat`) is equivalent
+to `--mode web` - passing anything at all (a controller-code, `--token`, or
+an explicit `--mode`) opts into CLI/token mode instead.
 
 | Option | Meaning |
 |--------|---------|
