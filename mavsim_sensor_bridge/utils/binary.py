@@ -146,10 +146,14 @@ def pack_lidar_scan(vessel_id: int, timestamp: float, points: np.ndarray, lidar_
     
     # Pack header: vessel_id (uint8), lidar_id (uint8), timestamp (float64), point_count (uint32)
     header = struct.pack('>BBdI', vessel_id, lidar_id, timestamp, point_count)
-    
-    # Pack points as float32 array (big-endian)
-    points_bytes = points.tobytes()
-    
+
+    # Pack points as float32 array, big-endian - plain np.float32 is the
+    # machine's native byte order (little-endian on x86/ARM), so it must be
+    # cast to the explicit '>f4' dtype to actually match the wire format
+    # (and the real producer, LidarStreamWorker.js's packLidarScan, which
+    # uses DataView.setFloat32(..., false) i.e. big-endian).
+    points_bytes = points.astype('>f4').tobytes()
+
     return header + points_bytes
 
 
@@ -183,10 +187,15 @@ def unpack_lidar_scan(data: bytes) -> Tuple[int, int, float, np.ndarray]:
                 f"Lidar scan data too short: expected {expected_size} bytes for {point_count} points, got {len(data)}"
             )
         
-        # Unpack points
+        # Unpack points. Wire format is big-endian float32 (see pack_lidar_scan
+        # and LidarStreamWorker.js's packLidarScan) - plain dtype=np.float32
+        # would read using the machine's native byte order (little-endian on
+        # x86/ARM), silently byte-swapping every coordinate/intensity value
+        # into garbage. astype(np.float32) at the end converts to native byte
+        # order for downstream numpy math / re-publishing.
         points_bytes = data[LIDAR_HEADER_SIZE:expected_size]
-        points = np.frombuffer(points_bytes, dtype=np.float32).reshape(point_count, 4)
-        
+        points = np.frombuffer(points_bytes, dtype='>f4').reshape(point_count, 4).astype(np.float32)
+
         return int(vessel_id), int(lidar_id), float(timestamp), points
     
     except struct.error as e:
