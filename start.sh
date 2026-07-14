@@ -186,11 +186,15 @@ elif ! docker image inspect "$DOCKER_IMAGE" &>/dev/null; then
 fi
 
 # ---- Network mode ----
-# --network host works only on Linux and is what lets your own ROS2 code on the
-# host talk to the bridge's local topics. On macOS / Windows Docker Desktop it
-# is ignored, so use the sibling-container path (see examples/docker/).
+# --network host is what lets your own ROS2 code on the host talk to the
+# bridge's local topics. Linux has always supported it natively; Docker
+# Desktop for Mac added support in 4.34+ (enable "Use Docker Compose V2" /
+# the "host networking" setting under Settings -> Resources -> Network), so
+# Mac now takes the same path as Linux with no URL rewriting needed. Windows
+# Docker Desktop still doesn't support it, so it keeps the sibling-container
+# path (see examples/docker/).
 USE_HOST_NET=true
-if [[ "$OSTYPE" == "darwin"* ]] || [[ "$OSTYPE" == "msys" ]] || [[ "$OSTYPE" == "cygwin" ]]; then
+if [[ "$OSTYPE" == "msys" ]] || [[ "$OSTYPE" == "cygwin" ]]; then
     USE_HOST_NET=false
 fi
 

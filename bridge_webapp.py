@@ -222,6 +222,7 @@ def upload_token():
         "vessels": vessels,
         "vessel_count": len(vessels),
         "token_path": str(token_path),
+        "frontend_url": token_data.get("frontend_url", ""),
     }), 200
 
 
@@ -239,6 +240,7 @@ def get_token_info():
             "controller_code": token_data.get("controller_code"),
             "vessels": vessels,
             "vessel_count": len(vessels),
+            "frontend_url": token_data.get("frontend_url", ""),
         }), 200
     except (json.JSONDecodeError, OSError):
         return jsonify({"loaded": False}), 200
@@ -617,6 +619,10 @@ function showTokenInfo(data){
     +'<div class="row"><span class="k">Code</span><span class="v">'+esc(data.controller_code||'')+'</span></div>'
     +'<div class="row"><span class="k">Vessels</span><span class="v">'+(data.vessel_count||0)+'</span></div>'
     +vlist+'</div>';
+  // Prefill Frontend URL from the token (plans/plan_headless_observer.md) -
+  // still a plain editable input, so this is just a sensible starting value,
+  // not an override lock; the field's current value always wins at Start.
+  if(data.frontend_url) $('#frontendUrl').value = data.frontend_url;
 }
 async function clearToken(){
   await fetch('/api/token',{method:'DELETE'});

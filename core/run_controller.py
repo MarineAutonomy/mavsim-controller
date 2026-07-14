@@ -187,7 +187,7 @@ def main():
             )
             controller = controller_class(
                 controller_code=token['controller_code'],
-                frontend_url=args.frontend_url,
+                frontend_url=token.get('frontend_url', args.frontend_url),
                 backend_url=token.get('backend_url', args.backend_url),
                 vessel_name=None,  # multi-vessel from token
                 camera_port=args.camera_port,
