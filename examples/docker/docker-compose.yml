@@ -14,13 +14,21 @@
 #
 # Build context is the user_repo_new root (..//..) so the controller image can
 # see ./interfaces and ./examples.
+#
+# ROS_DOMAIN_ID defaults to 42, not 0: with `network_mode: host` on Linux,
+# these containers share the host's network - if a local `docker compose`
+# mavsim stack is also running here, its simulation sessions use ROS_DOMAIN_ID
+# 0-4 (one per session slot, MAX_SESSIONS=5 by default). 42 stays clear of
+# that range so this bridge never silently shares a DDS domain with a local
+# session. See user_repo_new/README.md's "Why the default --ros-domain-id is
+# 42" note for the full explanation.
 
 services:
   bridge:
     image: mavlab/mavsim-controller:latest
     network_mode: host
     environment:
-      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}
+      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-42}
       - MAVSIM_CMD_TIMEOUT=1.0
       # Uncomment to also expose read-only telemetry for vessels you do NOT own:
       # - MAVSIM_OBSERVE_OTHERS=1
@@ -43,7 +51,7 @@ services:
     depends_on:
       - bridge
     environment:
-      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}
+      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-42}
     command:
       - "--vessel"
       - "${VESSEL:-matsya_01}"

@@ -92,6 +92,7 @@ class BridgeState:
                 cwd="/app",
                 bufsize=1,
                 universal_newlines=True,
+                start_new_session=True,
             )
             self.running = True
             self._reader_thread = threading.Thread(target=self._read_output, daemon=True)
@@ -103,11 +104,25 @@ class BridgeState:
             if not self.running or self.process is None:
                 return False
             logger.info("Stopping bridge (pid=%s)", self.process.pid)
-            self.process.terminate()
+            # Signal/kill the whole process group (start_new_session=True at
+            # launch), not just this PID - run_controller.py's SIGTERM
+            # handler runs BaseController.close(), which itself needs up to
+            # ~7s to cleanly tear down its own rosbridge/observer/visualizer
+            # subprocess groups, leaving little slack in our 8s wait below.
+            # If close() doesn't finish in time, a plain kill() here would
+            # only SIGKILL run_controller.py itself, leaving whatever it
+            # hadn't gotten to yet as orphans one layer further out.
+            try:
+                os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
+            except (ProcessLookupError, PermissionError) as e:
+                logger.debug("Error signaling bridge process group: %s", e)
             try:
                 self.process.wait(timeout=8)
             except subprocess.TimeoutExpired:
-                self.process.kill()
+                try:
+                    os.killpg(os.getpgid(self.process.pid), signal.SIGKILL)
+                except (ProcessLookupError, PermissionError) as e:
+                    logger.debug("Error killing bridge process group: %s", e)
                 self.process.wait()
             self.running = False
             self._cleanup_frames()
@@ -116,7 +131,6 @@ class BridgeState:
     @staticmethod
     def _build_command(config: dict) -> list:
         rate = config.get("rate", 10.0)
-        enable_sensors = config.get("enable_sensors", False)
         token_path = config.get("token_path", "")
 
         cmd = [sys.executable, "-u", "run_controller.py"]
@@ -134,8 +148,10 @@ class BridgeState:
                 cmd += ["--vessel-name", vessel_name]
 
         cmd += ["--rate", str(rate)]
-        if enable_sensors:
-            cmd.append("--enable-sensors")
+        # Sensors are always enabled (plans/plan_headless_observer.md) - no more
+        # opt-in --enable-sensors flag. The headless observer needs a real,
+        # reachable frontend URL to trigger camera/lidar streaming.
+        cmd += ["--frontend-url", config.get("frontend_url", "http://localhost:5173")]
         return cmd
 
     def _read_output(self):
@@ -254,10 +270,10 @@ def start_bridge():
 
     config = {
         "rate": float(data.get("rate", 10.0)),
-        "enable_sensors": bool(data.get("enable_sensors", False)),
         "observe_others": bool(data.get("observe_others", False)),
         "cmd_timeout": float(data.get("cmd_timeout", 1.0)),
         "ros_domain_id": data.get("ros_domain_id", ""),
+        "frontend_url": data.get("frontend_url") or "http://localhost:5173",
     }
     if use_token:
         config["token_path"] = str(token_path)
@@ -475,7 +491,10 @@ _FRONTEND_HTML = """<!DOCTYPE html>
 <body>
 <header>
   <div><h1>mavsim Bridge</h1><div class="sub">ROS2 bridge control panel</div></div>
-  <span id="statusBadge" class="status-badge stopped">Stopped</span>
+  <div style="display:flex;align-items:center;gap:12px">
+    <a id="visualizerLink" href="#" target="_blank" class="btn-secondary" style="display:none;text-decoration:none;padding:7px 14px;border-radius:6px;font-size:.85rem">Open ROS2 Visualizer &#8599;</a>
+    <span id="statusBadge" class="status-badge stopped">Stopped</span>
+  </div>
 </header>
 <main>
   <div class="left-col">
@@ -514,10 +533,8 @@ _FRONTEND_HTML = """<!DOCTYPE html>
       <input type="number" id="cmdTimeout" value="1.0" min="0" step="0.1">
       <label for="rosDomainId">ROS_DOMAIN_ID</label>
       <input type="number" id="rosDomainId" placeholder="container default" min="0" max="232">
-      <div class="toggle-row">
-        <span class="lbl">Enable Sensors<br><span class="hint">camera / lidar / imu topics &mdash; required if you want them in the recorded bag</span></span>
-        <label class="toggle"><input type="checkbox" id="enableSensors"><span class="slider"></span></label>
-      </div>
+      <label for="frontendUrl">Frontend URL (for camera/lidar streaming)</label>
+      <input type="text" id="frontendUrl" placeholder="http://localhost:5173">
       <div class="toggle-row">
         <span class="lbl">Observe Others<br><span class="hint">read-only odometry + actuator state for non-owned vessels</span></span>
         <label class="toggle"><input type="checkbox" id="observeOthers"><span class="slider"></span></label>
@@ -613,9 +630,9 @@ async function startBridge(){
   const body = {
     rate: parseFloat($('#rate').value)||10,
     cmd_timeout: parseFloat($('#cmdTimeout').value)||0,
-    enable_sensors: $('#enableSensors').checked,
     observe_others: $('#observeOthers').checked,
     ros_domain_id: $('#rosDomainId').value.trim(),
+    frontend_url: $('#frontendUrl').value.trim()||'http://localhost:5173',
   };
   if(currentMode==='token'){
     if(!tokenLoaded){alert('Load a token first');return;}
@@ -641,7 +658,10 @@ function setRunning(running){
   $('#startBtn').disabled = running; $('#stopBtn').disabled = !running;
   const b=$('#statusBadge'); b.textContent = running?'Running':'Stopped';
   b.className='status-badge '+(running?'running':'stopped');
-  ['code','backendUrl','vesselName','rate','cmdTimeout','rosDomainId','enableSensors','observeOthers',
+  const vLink=$('#visualizerLink');
+  vLink.style.display = running ? 'inline-block' : 'none';
+  if(running) vLink.href = 'http://'+location.hostname+':8899/';
+  ['code','backendUrl','vesselName','rate','cmdTimeout','rosDomainId','frontendUrl','observeOthers',
    'modeCodeTab','modeTokenTab','tokenText','loadTokenBtn','clearTokenBtn'].forEach(id=>{
     const el=$('#'+id); if(el) el.disabled=running;
   });
@@ -741,6 +761,9 @@ def main():
     parser.add_argument("--port", type=int, default=8888, help="Port to listen on")
     parser.add_argument("--backend-url", default="http://localhost:5000",
                         help="Default backend URL shown in the UI")
+    parser.add_argument("--frontend-url", default="http://localhost:5173",
+                        help="Default frontend URL shown in the UI - where the headless sensor "
+                             "observer navigates to (plans/plan_headless_observer.md)")
     args = parser.parse_args()
 
     global _FRONTEND_HTML
@@ -749,11 +772,19 @@ def main():
         f'placeholder="http://localhost:5000" value="{args.backend_url}"',
         1,
     )
+    _FRONTEND_HTML = _FRONTEND_HTML.replace(
+        'placeholder="http://localhost:5173"',
+        f'placeholder="http://localhost:5173" value="{args.frontend_url}"',
+        1,
+    )
 
     BAG_DIR.mkdir(parents=True, exist_ok=True)
     TOKEN_DIR.mkdir(parents=True, exist_ok=True)
 
-    logger.info("Starting bridge web panel on port %d (backend %s)", args.port, args.backend_url)
+    logger.info(
+        "Starting bridge web panel on port %d (backend %s, frontend %s)",
+        args.port, args.backend_url, args.frontend_url,
+    )
 
     def handle_signal(sig, frame):
         logger.info("Shutting down...")

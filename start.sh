@@ -4,8 +4,17 @@
 #
 # The bridge connects to the simulation and exposes it as LOCAL ROS2 topics:
 #   - publishes telemetry:  /<vessel>/vessel_state, /vessel_state_der,
-#                           /odometry_sim (+ sensors with --enable-sensors)
+#                           /odometry_sim, plus camera/lidar/imu/gps/encoder
+#                           topics (sensors are always enabled - see
+#                           plans/plan_headless_observer.md)
 #   - subscribes commands:  /<vessel>/actuator_cmd   (interfaces/Actuator)
+#
+# Camera/lidar data is captured in a browser (WebGL rendering), so a headless
+# Chromium tab is launched automatically alongside the bridge to trigger that
+# rendering without needing a human to keep a tab open - it needs to know
+# where the MAVSim frontend is actually hosted via --frontend-url (defaults
+# to http://localhost:5173, override whenever the bridge isn't on the same
+# machine as the frontend - e.g. a remote/lab server, or once deployed to AWS).
 #
 # You then run YOUR controller (any language) so that it subscribes to the
 # telemetry topics and publishes interfaces/Actuator on /<vessel>/actuator_cmd.
@@ -18,17 +27,22 @@
 #
 # Usage:
 #   ./start.sh <controller-code> [--vessel-name NAME] [--backend-url URL]
-#              [--enable-sensors] [--rate HZ] [--ros-domain-id N]
+#              [--frontend-url URL] [--rate HZ] [--ros-domain-id N]
 #              [--cmd-timeout SEC] [--observe-others]
 #   ./start.sh --token /path/to/token.json [options...]
-#   ./start.sh --mode web [--port 8888] [--backend-url URL] [--ros-domain-id N]
+#   ./start.sh --mode web [--port 8888] [--backend-url URL] [--frontend-url URL] [--ros-domain-id N]
 #
 # Examples:
 #   ./start.sh ABC123
-#   ./start.sh ABC123 --enable-sensors --observe-others
-#   ./start.sh ABC123 --ros-domain-id 42
+#   ./start.sh ABC123 --observe-others
+#   ./start.sh ABC123 --frontend-url http://my-server:5173
 #   ./start.sh --token ./mavsim_token_abc12345.json --observe-others
 #   ./start.sh --mode web
+#   ./start.sh ABC123 --ros-domain-id 43   # run a second bridge alongside this one
+#
+# --ros-domain-id defaults to 42 (not 0) on every run, including local Docker
+# testing against a `docker compose` mavsim stack - see the comment by
+# DEFAULT_ROS_DOMAIN_ID below for why.
 #
 # Recordings are saved to ./recordings/ on your machine.
 #
@@ -41,8 +55,20 @@ CONTAINER_NAME="mavsim-bridge-$$"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 DEFAULT_BACKEND_URL="http://localhost:5000"
+DEFAULT_FRONTEND_URL="http://localhost:5173"
 DEFAULT_WEBAPP_PORT=8888
-DEFAULT_ROS_DOMAIN_ID=0
+# Deliberately NOT 0. A local `docker compose` mavsim stack assigns each
+# simulation session its own ROS_DOMAIN_ID starting at 0 (one per session
+# slot, MAX_SESSIONS=5 by default -> domains 0-4, see
+# simulation_task/app/services/session_manager.py). ROS2/DDS discovery is
+# network-scoped, not container-scoped - if this bridge defaulted to the same
+# domain as a local session, it would silently see (and could record) that
+# session's own internal ROS2 topics via DDS, not just its own. 42 is always
+# set here, on every local Docker run, specifically to stay clear of that
+# range. Irrelevant for real cloud deployments (bridge and simulation task
+# are on separate networks there), but always set anyway since this same
+# start.sh is what people use for local testing too.
+DEFAULT_ROS_DOMAIN_ID=42
 DEFAULT_CMD_TIMEOUT=1.0
 RECORDINGS_DIR="$SCRIPT_DIR/recordings"
 BRIDGE_FILE="$SCRIPT_DIR/bridge_controller.py"
@@ -106,15 +132,35 @@ rewrite_url() {
     echo "$url"
 }
 
+# ---- GPU passthrough (NVIDIA only for now) ----
+# The headless sensor observer defaults to CPU-only SwiftShader rendering,
+# which can become unresponsive under real load (multiple vessels/sensors,
+# heavy post-processing). When a real GPU is available, request passthrough
+# so the observer can use it instead - examples/observer.py independently
+# re-checks GPU access from inside the container before picking Chromium's
+# render flags, so a false positive here just falls back to SwiftShader
+# rather than breaking anything. Detection has to happen here (not inside
+# the container) because Docker only grants GPU access at container-creation
+# time via `--gpus`, and passing that flag unconditionally would hard-fail
+# `docker run` on any machine without the nvidia-container-toolkit installed
+# at all - not degrade gracefully.
+GPU_AVAILABLE=false
+if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1 \
+   && command -v docker >/dev/null 2>&1 && docker info 2>/dev/null | grep -q '^ Runtimes:.*nvidia'; then
+    GPU_AVAILABLE=true
+fi
+
 # ===========================================================
 # Web mode
 # ===========================================================
 if [ "$MODE" = "web" ]; then
     BACKEND_URL="$DEFAULT_BACKEND_URL"
+    FRONTEND_URL="$DEFAULT_FRONTEND_URL"
     while [[ $# -gt 0 ]]; do
         case $1 in
             --port)          WEBAPP_PORT="$2"; shift 2 ;;
             --backend-url)   BACKEND_URL="$2"; shift 2 ;;
+            --frontend-url)  FRONTEND_URL="$2"; shift 2 ;;
             --ros-domain-id) ROS_DOMAIN_ID_VAL="$2"; shift 2 ;;
             *)               print_warn "Unknown argument: $1 (ignored)"; shift ;;
         esac
@@ -126,6 +172,7 @@ if [ "$MODE" = "web" ]; then
     fi
 
     CONTAINER_BACKEND_URL="$(rewrite_url "$BACKEND_URL")"
+    CONTAINER_FRONTEND_URL="$(rewrite_url "$FRONTEND_URL")"
 
     print_info "Starting mavsim bridge in WEB mode"
     print_info "  Image:        $DOCKER_IMAGE"
@@ -133,16 +180,26 @@ if [ "$MODE" = "web" ]; then
     print_info "  Backend:      $BACKEND_URL"
     [ "$BACKEND_URL" != "$CONTAINER_BACKEND_URL" ] && \
         print_info "  (inside container: $CONTAINER_BACKEND_URL)"
+    print_info "  Frontend:     $FRONTEND_URL"
+    [ "$FRONTEND_URL" != "$CONTAINER_FRONTEND_URL" ] && \
+        print_info "  (inside container: $CONTAINER_FRONTEND_URL)"
     print_info "  ROS_DOMAIN_ID: $ROS_DOMAIN_ID_VAL"
     print_info "  Recordings:    $RECORDINGS_DIR"
+    print_info "  Visualizer:    http://localhost:8899 (time histories, camera, point cloud, overlay)"
+    if [ "$GPU_AVAILABLE" = true ]; then
+        print_info "  GPU:           NVIDIA GPU detected - passing through for hardware-accelerated rendering"
+    else
+        print_info "  GPU:           none detected - observer uses CPU-only SwiftShader rendering"
+    fi
     echo ""
 
     DOCKER_ARGS=(docker run --rm --name "$CONTAINER_NAME")
+    [ "$GPU_AVAILABLE" = true ] && DOCKER_ARGS+=(--gpus all)
 
     if [ "$USE_HOST_NET" = true ]; then
         DOCKER_ARGS+=(--network host)
     else
-        DOCKER_ARGS+=(-p "$WEBAPP_PORT:$WEBAPP_PORT" -p "7001-7095:7001-7095")
+        DOCKER_ARGS+=(-p "$WEBAPP_PORT:$WEBAPP_PORT" -p "7001-7095:7001-7095" -p "9090:9090" -p "8899:8899")
     fi
 
     # The bridge webapp is mounted from this folder and launched via a custom
@@ -151,7 +208,7 @@ if [ "$MODE" = "web" ]; then
     WEB_CMD="source /opt/ros/humble/setup.bash \
         && source /ros2_ws/install/setup.bash \
         && cd /app \
-        && exec python3 /app/user_code/bridge_webapp.py --port '$WEBAPP_PORT' --backend-url '$CONTAINER_BACKEND_URL'"
+        && exec python3 /app/user_code/bridge_webapp.py --port '$WEBAPP_PORT' --backend-url '$CONTAINER_BACKEND_URL' --frontend-url '$CONTAINER_FRONTEND_URL'"
 
     DOCKER_ARGS+=(
         -e "ROS_DOMAIN_ID=$ROS_DOMAIN_ID_VAL"
@@ -189,13 +246,14 @@ if [ -z "$TOKEN_FILE" ] && [ $# -lt 1 ]; then
     print_error "Controller code or --token is required in CLI mode"
     echo ""
     echo "Usage:"
-    echo "  $0 <controller-code> [--vessel-name NAME] [--backend-url URL] [--enable-sensors] [--rate HZ] [--ros-domain-id N] [--cmd-timeout SEC] [--observe-others]"
+    echo "  $0 <controller-code> [--vessel-name NAME] [--backend-url URL] [--frontend-url URL] [--rate HZ] [--ros-domain-id N] [--cmd-timeout SEC] [--observe-others]"
     echo "  $0 --token /path/to/token.json [options...]"
-    echo "  $0 --mode web [--port 8888] [--backend-url URL] [--ros-domain-id N]"
+    echo "  $0 --mode web [--port 8888] [--backend-url URL] [--frontend-url URL] [--ros-domain-id N]"
     echo ""
     echo "Examples:"
     echo "  $0 ABC123"
-    echo "  $0 ABC123 --enable-sensors --observe-others"
+    echo "  $0 ABC123 --observe-others"
+    echo "  $0 ABC123 --frontend-url http://my-server:5173"
     echo "  $0 --token ./mavsim_token_abc12345.json"
     echo "  $0 --mode web"
     exit 1
@@ -207,8 +265,8 @@ if [ -z "$TOKEN_FILE" ]; then
 fi
 
 BACKEND_URL="$DEFAULT_BACKEND_URL"
+FRONTEND_URL="$DEFAULT_FRONTEND_URL"
 VESSEL_NAME=""
-ENABLE_SENSORS=false
 OBSERVE_OTHERS=false
 CMD_TIMEOUT="$DEFAULT_CMD_TIMEOUT"
 # Args understood by the container's run_controller.py.
@@ -217,8 +275,8 @@ PYTHON_ARGS=()
 while [[ $# -gt 0 ]]; do
     case $1 in
         --backend-url)     BACKEND_URL="$2"; shift 2 ;;
+        --frontend-url)    FRONTEND_URL="$2"; shift 2 ;;
         --vessel-name)     VESSEL_NAME="$2"; PYTHON_ARGS+=("--vessel-name" "$2"); shift 2 ;;
-        --enable-sensors)  ENABLE_SENSORS=true; PYTHON_ARGS+=("--enable-sensors"); shift ;;
         --rate)            PYTHON_ARGS+=("--rate" "$2"); shift 2 ;;
         # Bridge-only options -> passed to the container via environment vars,
         # since run_controller.py does not understand them.
@@ -230,6 +288,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 CONTAINER_BACKEND_URL="$(rewrite_url "$BACKEND_URL")"
+CONTAINER_FRONTEND_URL="$(rewrite_url "$FRONTEND_URL")"
+PYTHON_ARGS+=("--frontend-url" "$CONTAINER_FRONTEND_URL")
 
 if [ -n "$TOKEN_FILE" ]; then
     print_info "Starting mavsim bridge in TOKEN mode"
@@ -243,21 +303,32 @@ fi
 print_info "  Backend:      $BACKEND_URL"
 [ "$BACKEND_URL" != "$CONTAINER_BACKEND_URL" ] && \
     print_info "  (inside container: $CONTAINER_BACKEND_URL)"
+print_info "  Frontend:     $FRONTEND_URL"
+[ "$FRONTEND_URL" != "$CONTAINER_FRONTEND_URL" ] && \
+    print_info "  (inside container: $CONTAINER_FRONTEND_URL)"
 print_info "  ROS_DOMAIN_ID: $ROS_DOMAIN_ID_VAL"
 print_info "  Cmd timeout:  ${CMD_TIMEOUT}s"
 print_info "  Recordings:   $RECORDINGS_DIR"
 [ -n "$VESSEL_NAME" ]        && print_info "  Vessel:       $VESSEL_NAME"
-[ "$ENABLE_SENSORS" = true ] && print_info "  Sensors:      enabled"
-[ "$ENABLE_SENSORS" = true ] && print_info "  Camera viewer: open camera_viewer.html in a browser"
+print_info "  Sensors:      always enabled (camera/lidar via headless observer)"
+print_info "  Visualizer:   http://localhost:8899 (time histories, camera, point cloud, overlay)"
+if [ "$GPU_AVAILABLE" = true ]; then
+    print_info "  GPU:          NVIDIA GPU detected - passing through for hardware-accelerated rendering"
+else
+    print_info "  GPU:          none detected - observer uses CPU-only SwiftShader rendering"
+fi
 [ "$OBSERVE_OTHERS" = true ] && print_info "  Observe-others: enabled (read-only telemetry for non-owned vessels)"
 echo ""
 
 DOCKER_ARGS=(docker run --rm --name "$CONTAINER_NAME")
+[ "$GPU_AVAILABLE" = true ] && DOCKER_ARGS+=(--gpus all)
 
 if [ "$USE_HOST_NET" = true ]; then
     DOCKER_ARGS+=(--network host)
-elif [ "$ENABLE_SENSORS" = true ]; then
-    DOCKER_ARGS+=(-p "7001-7095:7001-7095")
+else
+    # Sensors (camera/lidar) are always enabled now, so these ports are always needed.
+    # 9090/8899: rosbridge websocket + the local ROS2 topic visualizer's Flask app.
+    DOCKER_ARGS+=(-p "7001-7095:7001-7095" -p "9090:9090" -p "8899:8899")
 fi
 
 # Bridge configuration via environment variables.

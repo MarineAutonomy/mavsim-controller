@@ -14,7 +14,8 @@ What it does
        /<vessel>/vessel_state        std_msgs/Float64MultiArray
        /<vessel>/vessel_state_der    std_msgs/Float64MultiArray
        /<vessel>/odometry_sim        nav_msgs/Odometry
-   plus sensor topics when --enable-sensors is used (camera, lidar, imu, ...).
+   plus camera/lidar sensor topics (always enabled, streamed via a headless
+   observer browser - see plans/plan_headless_observer.md).
 3. Subscribes to a LOCAL actuator command topic for every vessel you own:
        /<vessel>/actuator_cmd        interfaces/Actuator
    The latest message received is stored (and overwritten by newer ones).
@@ -108,15 +109,15 @@ class MyController(BaseController):
         self._spin_executor = None
         self._spin_thread = None
 
-        # Write camera frames to disk for the web viewer when sensors are on.
-        if self.enable_sensors:
-            try:
-                FRAME_DIR.mkdir(parents=True, exist_ok=True)
-                for vid in range(10):
-                    for cid in range(10):
-                        self.on_camera(vessel_id=vid, camera_id=cid)(self._on_camera_frame)
-            except Exception as exc:  # pragma: no cover - best effort
-                logger.debug("Could not set up camera frame writing: %s", exc)
+        # Write camera frames to disk for the web viewer. Sensors are always
+        # enabled now (plans/plan_headless_observer.md) - no more opt-in flag.
+        try:
+            FRAME_DIR.mkdir(parents=True, exist_ok=True)
+            for vid in range(10):
+                for cid in range(10):
+                    self.on_camera(vessel_id=vid, camera_id=cid)(self._on_camera_frame)
+        except Exception as exc:  # pragma: no cover - best effort
+            logger.debug("Could not set up camera frame writing: %s", exc)
 
         logger.info(
             "Bridge controller initialized (observe_others=%s, cmd_timeout=%.2fs)",
