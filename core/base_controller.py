@@ -64,7 +64,8 @@ class BaseController:
                  camera_port: Optional[int] = None, lidar_port: Optional[int] = None,
                  sensor_base_port: int = SENSOR_BRIDGE_BASE_PORT,
                  token: Optional[Dict] = None,
-                 rosbridge_port: int = 9090, visualizer_port: int = 8899):
+                 rosbridge_port: int = 9090, visualizer_port: int = 8899,
+                 teleop_http_port: int = 8900, teleop_ws_port: int = 8901):
         """
         Initialize base controller with automatic handshake.
 
@@ -87,6 +88,10 @@ class BaseController:
                 (default: 9090)
             visualizer_port: Local port for the ROS2 topic visualizer's Flask
                 app (default: 8899)
+            teleop_http_port: Local port for the keyboard teleop page
+                (plans/plan_teleop.md) (default: 8900)
+            teleop_ws_port: Local port for the teleop key/telemetry WebSocket
+                (default: 8901)
         """
         self.controller_code = controller_code
         self.frontend_url = frontend_url
@@ -98,6 +103,8 @@ class BaseController:
         self.token = token
         self.rosbridge_port = rosbridge_port
         self.visualizer_port = visualizer_port
+        self.teleop_http_port = teleop_http_port
+        self.teleop_ws_port = teleop_ws_port
 
         # Headless sensor observer subprocess (plans/plan_headless_observer.md) -
         # launched once, on the first successful handshake in this session; see
@@ -111,7 +118,12 @@ class BaseController:
         # token mode with no other web UI running at all.
         self._rosbridge_process: Optional[subprocess.Popen] = None
         self._visualizer_process: Optional[subprocess.Popen] = None
-        
+
+        # Keyboard teleop node (plans/plan_teleop.md): publishes
+        # interfaces/Actuator commands on /<vessel>/actuator_cmd from
+        # browser keypresses, launched once per session the same way.
+        self._teleop_process: Optional[subprocess.Popen] = None
+
         # Multi-vessel mode: list of vessel ros_names from token
         self._token_vessels = token.get('vessels', []) if token else []
         self._multi_vessel = len(self._token_vessels) > 1
@@ -380,6 +392,16 @@ class BaseController:
             # lidar overlay - fetched once per vessel (each vessel needs its own
             # sensor list) and merged into the same shared state file.
             self._fetch_and_cache_sensor_config(session_id, api_token, bound_name)
+
+            # Keyboard teleop (plans/plan_teleop.md): launched once per
+            # session like rosbridge/visualizer above. Its per-vessel
+            # thruster/control-surface geometry is already in-process on
+            # `ctrl` (no HTTP round-trip needed, unlike the sensor-config
+            # snapshot above), so it's written directly instead of fetched.
+            if self._teleop_process is None:
+                self._reset_teleop_state_file()
+                self._launch_teleop()
+            self._write_teleop_config(bound_name, ctrl)
 
             return True
 
@@ -1302,6 +1324,77 @@ class BaseController:
             logger.warning(f"Failed to launch ROS2 topic visualizer: {e}")
             self._visualizer_process = None
 
+    def _reset_teleop_state_file(self):
+        """
+        Clear the shared teleop_config.json state file at the start of a
+        fresh session, before any vessel writes into it - same rationale and
+        pattern as _reset_visualizer_state_file() above (a vessel from a
+        previous, already-stopped session must not leak into this session's
+        teleop vessel list).
+        """
+        try:
+            state_file = os.path.join("/tmp/mavsim_bridge_state", "teleop_config.json")
+            if os.path.exists(state_file):
+                os.remove(state_file)
+        except OSError as e:
+            logger.debug(f"Failed to reset teleop state file: {e}")
+
+    def _launch_teleop(self):
+        """
+        Launch the keyboard teleop node (plans/plan_teleop.md): an rclpy
+        process that publishes interfaces/Actuator commands on
+        /<vessel>/actuator_cmd from browser keypresses, and serves its own
+        page + WebSocket. Launched once per session, the same way as
+        rosbridge/the visualizer above.
+        """
+        try:
+            script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "teleop_node.py")
+            self._teleop_process = subprocess.Popen([
+                sys.executable, script,
+                "--http-port", str(self.teleop_http_port),
+                "--ws-port", str(self.teleop_ws_port),
+            ], start_new_session=True)
+            logger.info(f"Launched keyboard teleop on port {self.teleop_http_port} "
+                        f"(ws {self.teleop_ws_port}, pid={self._teleop_process.pid})")
+        except Exception as e:
+            logger.warning(f"Failed to launch keyboard teleop: {e}")
+            self._teleop_process = None
+
+    def _write_teleop_config(self, vessel_name: str, ctrl: 'MavsimController'):
+        """
+        Write this vessel's thruster/control-surface geometry to the shared
+        teleop_config.json state file the teleop node reads at startup to
+        build its per-vessel ThrustAllocator. Merge-write pattern like
+        _fetch_and_cache_sensor_config() above, but simpler - no HTTP fetch
+        needed, since ctrl.thrusters/ctrl.control_surfaces are already
+        in-process by the time this is called.
+        """
+        try:
+            import json
+
+            state_dir = "/tmp/mavsim_bridge_state"
+            os.makedirs(state_dir, exist_ok=True)
+            state_file = os.path.join(state_dir, "teleop_config.json")
+
+            existing = {}
+            if os.path.exists(state_file):
+                try:
+                    with open(state_file, "r") as f:
+                        existing = json.load(f)
+                except (json.JSONDecodeError, OSError):
+                    existing = {}
+
+            existing[vessel_name] = {
+                "thrusters": self._extract_thrusters(ctrl),
+                "control_surfaces": self._extract_control_surfaces(ctrl),
+            }
+            with open(state_file, "w") as f:
+                json.dump(existing, f)
+
+            logger.info(f"Wrote teleop config for {vessel_name}")
+        except Exception as e:
+            logger.warning(f"Failed to write teleop config for {vessel_name}: {e}")
+
     def _fetch_and_cache_sensor_config(self, session_id: str, api_token: str, vessel_name: str):
         """
         Fetch this vessel's sensor extrinsics/intrinsics (mounting location/
@@ -1408,6 +1501,7 @@ class BaseController:
             ("_observer_process", "headless sensor observer"),
             ("_rosbridge_process", "rosbridge websocket"),
             ("_visualizer_process", "ROS2 topic visualizer"),
+            ("_teleop_process", "keyboard teleop node"),
         ]
         procs = [(attr, label, getattr(self, attr)) for attr, label in to_stop]
         for attr, label, proc in procs:
@@ -1541,6 +1635,10 @@ def create_controller_from_args() -> BaseController:
                        help='Local rosbridge websocket port for the ROS2 topic visualizer (default: 9090)')
     parser.add_argument('--visualizer-port', type=int, default=8899,
                        help='Local ROS2 topic visualizer port (default: 8899)')
+    parser.add_argument('--teleop-http-port', type=int, default=8900,
+                       help='Local keyboard teleop page port (default: 8900)')
+    parser.add_argument('--teleop-ws-port', type=int, default=8901,
+                       help='Local keyboard teleop key/telemetry WebSocket port (default: 8901)')
 
     args = parser.parse_args()
 
@@ -1556,6 +1654,8 @@ def create_controller_from_args() -> BaseController:
         sensor_base_port=args.sensor_base_port,
         rosbridge_port=args.rosbridge_port,
         visualizer_port=args.visualizer_port,
+        teleop_http_port=args.teleop_http_port,
+        teleop_ws_port=args.teleop_ws_port,
     )
 
     return controller

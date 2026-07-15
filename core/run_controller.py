@@ -176,6 +176,10 @@ def main():
                                 '(default: 9090)')
         parser.add_argument('--visualizer-port', type=int, default=8899,
                            help='Local ROS2 topic visualizer port (default: 8899)')
+        parser.add_argument('--teleop-http-port', type=int, default=8900,
+                           help='Local keyboard teleop page port (default: 8900)')
+        parser.add_argument('--teleop-ws-port', type=int, default=8901,
+                           help='Local keyboard teleop key/telemetry WebSocket port (default: 8901)')
 
         args = parser.parse_args()
 
@@ -196,6 +200,8 @@ def main():
                 token=token,
                 rosbridge_port=args.rosbridge_port,
                 visualizer_port=args.visualizer_port,
+                teleop_http_port=args.teleop_http_port,
+                teleop_ws_port=args.teleop_ws_port,
             )
         else:
             controller = controller_class(
@@ -208,6 +214,8 @@ def main():
                 sensor_base_port=args.sensor_base_port,
                 rosbridge_port=args.rosbridge_port,
                 visualizer_port=args.visualizer_port,
+                teleop_http_port=args.teleop_http_port,
+                teleop_ws_port=args.teleop_ws_port,
             )
         
         logger.info("Starting controller...")

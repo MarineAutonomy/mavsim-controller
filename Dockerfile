@@ -110,6 +110,15 @@ COPY user_repo_new/core/observer.py .
 COPY user_repo_new/core/visualizer_server.py .
 COPY user_repo_new/core/vendor/three.min.js /app/static/three.min.js
 
+# Keyboard teleop (plans/plan_teleop.md): an rclpy node that publishes
+# interfaces/Actuator commands on /<vessel>/actuator_cmd from browser
+# keypresses, plus its own page/WebSocket server - launched as a subprocess
+# of base_controller.py the same way as rosbridge/visualizer above. Flat
+# into /app (not a package), matching every other core script - start.sh
+# bind-mounts the same files from user_repo_new/teleop/ on top of these.
+COPY user_repo_new/teleop/allocation.py .
+COPY user_repo_new/teleop/teleop_node.py .
+
 # Expose sensor bridge ports for vessel *
 # 70*1: Camera
 # 70*2: Lidar
@@ -131,6 +140,9 @@ EXPOSE 8888
 
 # ROS2 topic visualizer: rosbridge websocket + its static/API Flask server
 EXPOSE 9090 8899
+
+# Keyboard teleop: page + key/telemetry WebSocket
+EXPOSE 8900 8901
 
 # Set Python unbuffered for real-time logging
 ENV PYTHONUNBUFFERED=1

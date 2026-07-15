@@ -495,6 +495,7 @@ _FRONTEND_HTML = """<!DOCTYPE html>
   <div><h1>mavsim Bridge</h1><div class="sub">ROS2 bridge control panel</div></div>
   <div style="display:flex;align-items:center;gap:12px">
     <a id="visualizerLink" href="#" target="_blank" class="btn-secondary" style="display:none;text-decoration:none;padding:7px 14px;border-radius:6px;font-size:.85rem">Open ROS2 Visualizer &#8599;</a>
+    <a id="teleopLink" href="#" target="_blank" class="btn-secondary" style="display:none;text-decoration:none;padding:7px 14px;border-radius:6px;font-size:.85rem">Open Teleop Control &#8599;</a>
     <span id="statusBadge" class="status-badge stopped">Stopped</span>
   </div>
 </header>
@@ -667,6 +668,9 @@ function setRunning(running){
   const vLink=$('#visualizerLink');
   vLink.style.display = running ? 'inline-block' : 'none';
   if(running) vLink.href = 'http://'+location.hostname+':8899/';
+  const tLink=$('#teleopLink');
+  tLink.style.display = running ? 'inline-block' : 'none';
+  if(running) tLink.href = 'http://'+location.hostname+':8900/';
   ['code','backendUrl','vesselName','rate','cmdTimeout','rosDomainId','frontendUrl','observeOthers',
    'modeCodeTab','modeTokenTab','tokenText','loadTokenBtn','clearTokenBtn'].forEach(id=>{
     const el=$('#'+id); if(el) el.disabled=running;

@@ -98,6 +98,10 @@ CORE_DIR="$SCRIPT_DIR/core"
 CORE_FILES=(base_controller.py python_controller.py run_controller.py \
             recording_service.py local_sensor_generator.py observer.py \
             visualizer_server.py)
+# Keyboard teleop (plans/plan_teleop.md) - bind-mounted the same way as
+# CORE_FILES above, but from its own teleop/ folder.
+TELEOP_DIR="$SCRIPT_DIR/teleop"
+TELEOP_FILES=(allocation.py teleop_node.py)
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -172,6 +176,14 @@ for f in "${CORE_FILES[@]}"; do
     if [ ! -f "$CORE_DIR/$f" ]; then
         print_error "$f not found under $CORE_DIR"
         print_error "Re-clone user_repo_new or restore user_repo_new/core/."
+        exit 1
+    fi
+done
+
+for f in "${TELEOP_FILES[@]}"; do
+    if [ ! -f "$TELEOP_DIR/$f" ]; then
+        print_error "$f not found under $TELEOP_DIR"
+        print_error "Re-clone user_repo_new or restore user_repo_new/teleop/."
         exit 1
     fi
 done
@@ -261,6 +273,7 @@ if [ "$MODE" = "web" ]; then
     print_info "  ROS_DOMAIN_ID: $ROS_DOMAIN_ID_VAL"
     print_info "  Recordings:    $RECORDINGS_DIR"
     print_info "  Visualizer:    http://localhost:8899 (time histories, camera, point cloud, overlay)"
+    print_info "  Teleop:        http://localhost:8900 (keyboard control)"
     if [ "$GPU_AVAILABLE" = true ]; then
         print_info "  GPU:           NVIDIA GPU detected - passing through for hardware-accelerated rendering"
     else
@@ -274,7 +287,7 @@ if [ "$MODE" = "web" ]; then
     if [ "$USE_HOST_NET" = true ]; then
         DOCKER_ARGS+=(--network host)
     else
-        DOCKER_ARGS+=(-p "$WEBAPP_PORT:$WEBAPP_PORT" -p "7001-7095:7001-7095" -p "9090:9090" -p "8899:8899")
+        DOCKER_ARGS+=(-p "$WEBAPP_PORT:$WEBAPP_PORT" -p "7001-7095:7001-7095" -p "9090:9090" -p "8899:8899" -p "8900:8900" -p "8901:8901")
     fi
 
     # The bridge webapp is mounted from this folder and launched via a custom
@@ -293,6 +306,9 @@ if [ "$MODE" = "web" ]; then
     )
     for f in "${CORE_FILES[@]}"; do
         DOCKER_ARGS+=(-v "$CORE_DIR/$f:/app/$f:ro")
+    done
+    for f in "${TELEOP_FILES[@]}"; do
+        DOCKER_ARGS+=(-v "$TELEOP_DIR/$f:/app/$f:ro")
     done
     DOCKER_ARGS+=(
         --entrypoint /bin/bash
@@ -393,6 +409,7 @@ print_info "  Recordings:   $RECORDINGS_DIR"
 [ -n "$VESSEL_NAME" ]        && print_info "  Vessel:       $VESSEL_NAME"
 print_info "  Sensors:      always enabled (camera/lidar via headless observer)"
 print_info "  Visualizer:   http://localhost:8899 (time histories, camera, point cloud, overlay)"
+print_info "  Teleop:       http://localhost:8900 (keyboard control)"
 if [ "$GPU_AVAILABLE" = true ]; then
     print_info "  GPU:          NVIDIA GPU detected - passing through for hardware-accelerated rendering"
 else
@@ -409,7 +426,8 @@ if [ "$USE_HOST_NET" = true ]; then
 else
     # Sensors (camera/lidar) are always enabled now, so these ports are always needed.
     # 9090/8899: rosbridge websocket + the local ROS2 topic visualizer's Flask app.
-    DOCKER_ARGS+=(-p "7001-7095:7001-7095" -p "9090:9090" -p "8899:8899")
+    # 8900/8901: keyboard teleop page + its key/telemetry WebSocket.
+    DOCKER_ARGS+=(-p "7001-7095:7001-7095" -p "9090:9090" -p "8899:8899" -p "8900:8900" -p "8901:8901")
 fi
 
 # Bridge configuration via environment variables.
@@ -423,6 +441,9 @@ DOCKER_ARGS+=(
 )
 for f in "${CORE_FILES[@]}"; do
     DOCKER_ARGS+=(-v "$CORE_DIR/$f:/app/$f:ro")
+done
+for f in "${TELEOP_FILES[@]}"; do
+    DOCKER_ARGS+=(-v "$TELEOP_DIR/$f:/app/$f:ro")
 done
 
 if [ -n "$TOKEN_FILE" ]; then
