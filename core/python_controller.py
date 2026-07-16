@@ -577,6 +577,11 @@ class RoslibSubscriber:
         # Raw state arrays for local sensor generation
         self._raw_vessel_states: Dict[str, np.ndarray] = {}
         self._raw_vessel_state_ders: Dict[str, np.ndarray] = {}
+        # Elapsed sim time (leading element of the vessel_state message, stripped
+        # from _raw_vessel_states above) -- needed by time-dependent client-side
+        # sensors such as the wave probe, which don't derive their measurement
+        # from vessel motion alone.
+        self._raw_vessel_state_times: Dict[str, float] = {}
         self._vessel_state_der_topics: list = []
         self._state_der_callbacks: List[Callable] = []
         
@@ -818,6 +823,7 @@ class RoslibSubscriber:
                 self._vessel_states[ros_name] = vs
                 # Store raw state array (strip timestamp) for sensor generation
                 self._raw_vessel_states[ros_name] = np.array(data[1:])
+                self._raw_vessel_state_times[ros_name] = float(data[0])
         except Exception as e:
             logger.warning(f"Error parsing vessel_state for {ros_name}: {e}")
 
@@ -895,6 +901,11 @@ class RoslibSubscriber:
         """Return the latest raw state derivative array (no timestamp) for a vessel."""
         with self._vessel_state_lock:
             return self._raw_vessel_state_ders.get(ros_name)
+
+    def get_raw_state_time(self, ros_name: str) -> Optional[float]:
+        """Return the elapsed sim time (s) of the latest vessel_state message for a vessel."""
+        with self._vessel_state_lock:
+            return self._raw_vessel_state_times.get(ros_name)
 
     def get_vessel_states(self) -> Dict[str, VesselState]:
         """Return a snapshot dict of all vessel states keyed by ros_name."""
@@ -1410,6 +1421,10 @@ class MavsimController:
     def get_raw_state_der(self, ros_name: str) -> Optional[np.ndarray]:
         """Return latest raw state derivative array (no timestamp)."""
         return self.subscriber.get_raw_state_der(ros_name)
+
+    def get_raw_state_time(self, ros_name: str) -> Optional[float]:
+        """Return the elapsed sim time (s) of the latest vessel_state message."""
+        return self.subscriber.get_raw_state_time(ros_name)
 
     def set_target(self, x: float, y: float, heading: Optional[float] = None):
         """

@@ -140,11 +140,20 @@ class BaseController:
         self._control_thread: Optional[threading.Thread] = None
         self._control_rate_hz = 10.0
         
-        # Local sensor generators (per vessel) for client-side IMU/GPS/DVL/Encoder
+        # Local sensor generators (per vessel) for client-side IMU/GPS/DVL/Encoder/WaveProbe
         self._sensor_generators: Dict[str, 'LocalSensorGenerator'] = {}
         self._ros2_sensor_pubs: Dict[str, dict] = {}
         self._ros2_republishers: Dict[str, object] = {}
         self._ros2_node = None
+
+        # Wave environment (component list), session-wide (not per-vessel) -
+        # fetched once via _fetch_and_cache_sensor_config()'s existing
+        # fullConfig request and reused by every vessel's LocalWaveProbeSensor.
+        # Wave elevation must never be streamed server->client as a computed
+        # value; the controller instead gets the wave component list once,
+        # and computes elevation itself from vessel state, exactly like every
+        # other client-side sensor.
+        self._wave_environment: Dict = {'components': [], 'standalone_probes': []}
 
         # Recording state
         self._recording = False
@@ -459,6 +468,7 @@ class BaseController:
                 vessel_name=vname,
                 use_quaternion=use_quat,
                 on_measurement=make_callback(vname),
+                wave_environment=self._wave_environment,
             )
             self._sensor_generators[vname] = gen
 
@@ -595,8 +605,9 @@ class BaseController:
                 continue
             state = ctrl.get_raw_state(vname)
             state_der = ctrl.get_raw_state_der(vname)
+            sim_time = ctrl.get_raw_state_time(vname)
             if state is not None:
-                gen.update_state(state, state_der)
+                gen.update_state(state, state_der, sim_time=sim_time)
 
     def _init_ros2_sensor_node(self):
         """Lazily initialize a local ROS2 node for publishing sensor topics."""
@@ -627,7 +638,7 @@ class BaseController:
                 self._ros2_sensor_pubs[topic] = {'pub': pub, 'type': sensor_type, 'msg_type': msg_type}
 
             pub_info = self._ros2_sensor_pubs[topic]
-            msg = self._build_sensor_msg(pub_info['type'], measurement)
+            msg = self._build_sensor_msg(pub_info['type'], measurement, node=self._ros2_node)
             if msg is not None:
                 pub_info['pub'].publish(msg)
         except Exception as e:
@@ -650,13 +661,21 @@ class BaseController:
             elif stype == 'encoder':
                 from std_msgs.msg import Float64MultiArray
                 return Float64MultiArray
+            elif stype == 'waveprobe':
+                from interfaces.msg import WaveProbe
+                return WaveProbe
         except ImportError:
             pass
         return None
 
     @staticmethod
-    def _build_sensor_msg(sensor_type: str, measurement: dict):
-        """Build a ROS2 message from a sensor measurement dict."""
+    def _build_sensor_msg(sensor_type: str, measurement: dict, node=None):
+        """Build a ROS2 message from a sensor measurement dict.
+
+        `node` is only used by sensor types (e.g. waveprobe) that need a ROS
+        clock to stamp their header -- most sensor types here don't stamp a
+        header at all and ignore it.
+        """
         import numpy as np
         stype = sensor_type.lower()
         try:
@@ -704,6 +723,19 @@ class BaseController:
                 from std_msgs.msg import Float64MultiArray
                 msg = Float64MultiArray()
                 msg.data = [float(v) for v in measurement.get('actuator_values', [])]
+                return msg
+
+            elif stype == 'waveprobe':
+                from interfaces.msg import WaveProbe
+                from geometry_msgs.msg import Point
+                msg = WaveProbe()
+                if node is not None:
+                    msg.header.stamp = node.get_clock().now().to_msg()
+                msg.header.frame_id = 'waveprobe_frame'
+                msg.elevation = float(measurement['elevation'])
+                msg.location = Point(
+                    x=float(measurement.get('x', 0.0)), y=float(measurement.get('y', 0.0)), z=0.0
+                )
                 return msg
 
         except Exception as e:
@@ -1421,6 +1453,13 @@ class BaseController:
             )
             response.raise_for_status()
             full_config = response.json().get("fullConfig", {})
+
+            # Wave environment is session-wide (not per-vessel) - cache it once
+            # for LocalWaveProbeSensor, reusing this same fullConfig fetch rather
+            # than a second HTTP round-trip. See _setup_local_sensors().
+            self._wave_environment = full_config.get(
+                "wave_environment", {"components": [], "standalone_probes": []}
+            )
 
             # Agents don't carry their own ROS name - it's constructed the same
             # way python_controller.py builds full_vessel_name: f"{name}_{vessel_id}"

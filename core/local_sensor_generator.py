@@ -172,7 +172,7 @@ class LocalIMUSensor:
                 self.lin_acc_cov = np.array(custom_cov['linear_acceleration_covariance']).reshape(3, 3)
 
     def get_measurement(self, state: np.ndarray, state_der: np.ndarray,
-                        use_quaternion: bool = False) -> dict:
+                        use_quaternion: bool = False, **kwargs) -> dict:
         if not use_quaternion:
             eul = state[9:12]
             quat = _eul_to_quat(eul)
@@ -226,7 +226,7 @@ class LocalGPSSensor:
             self.gps_cov = np.array(custom_cov['position_covariance']).reshape(3, 3)
 
     def get_measurement(self, state: np.ndarray, state_der: np.ndarray,
-                        use_quaternion: bool = False) -> dict:
+                        use_quaternion: bool = False, **kwargs) -> dict:
         if not use_quaternion:
             orientation = _eul_to_quat(state[9:12])
         else:
@@ -260,7 +260,7 @@ class LocalDVLSensor:
             self.vel_cov = np.array(custom_cov['linear_velocity_covariance']).reshape(3, 3)
 
     def get_measurement(self, state: np.ndarray, state_der: np.ndarray,
-                        use_quaternion: bool = False) -> dict:
+                        use_quaternion: bool = False, **kwargs) -> dict:
         v_body = state[0:3]
         v_body_noisy = v_body + np.random.multivariate_normal(np.zeros(3), self.vel_cov)
         return {
@@ -319,7 +319,7 @@ class LocalEncoderSensor:
                 })
 
     def get_measurement(self, state: np.ndarray, state_der: np.ndarray,
-                        use_quaternion: bool = False) -> dict:
+                        use_quaternion: bool = False, **kwargs) -> dict:
         actuator_values = []
         actuator_names = []
         covariances = []
@@ -338,6 +338,61 @@ class LocalEncoderSensor:
         }
 
 
+class LocalWaveProbeSensor:
+    """Wave probe sensor that operates on raw state arrays.
+
+    Reports sea surface elevation at this sensor's world (x, y) position
+    (vessel position plus a rotated body-frame offset), evaluated directly
+    from the wave environment's flat component list -- the same closed-form
+    linear superposition used by the standalone (server-side) wave probes in
+    ros2_ws/src/mavsim/mavsim/module_world_wave_probe.py. Deterministic, no
+    noise model.
+    """
+
+    def __init__(self, sensor_config: dict, wave_environment: Optional[dict] = None, gravity: float = 9.80665):
+        self.sensor_type = 'WaveProbe'
+        self.rate = sensor_config.get('publish_rate', 10)
+        self.location = np.array(sensor_config.get('sensor_location', [0, 0, 0]), dtype=float)
+
+        components = (wave_environment or {}).get('components', [])
+        if components:
+            amplitude = np.array([c['amplitude'] for c in components], dtype=float)
+            omega = np.array([(2 * np.pi) / c['period'] for c in components], dtype=float)
+            direction = np.array([c['direction'] * np.pi / 180.0 for c in components], dtype=float)
+            phase = np.array([c['phase'] * np.pi / 180.0 for c in components], dtype=float)
+            k = omega ** 2 / gravity
+            self._A = amplitude
+            self._omega = omega
+            self._phase = phase
+            self._kcos = k * np.cos(direction)
+            self._ksin = k * np.sin(direction)
+        else:
+            self._A = np.zeros(0)
+            self._omega = np.zeros(0)
+            self._phase = np.zeros(0)
+            self._kcos = np.zeros(0)
+            self._ksin = np.zeros(0)
+
+    def get_measurement(self, state: np.ndarray, state_der: np.ndarray,
+                        use_quaternion: bool = False, sim_time: float = 0.0, **kwargs) -> dict:
+        if not use_quaternion:
+            orientation = _eul_to_quat(state[9:12])
+        else:
+            orientation = state[9:13]
+
+        ned = state[6:9] + _quat_to_rotm(orientation) @ self.location
+        x, y = ned[0], ned[1]
+
+        if self._A.size == 0:
+            eta = 0.0
+        else:
+            eta = float(np.sum(self._A * np.cos(
+                self._omega * sim_time - self._kcos * x - self._ksin * y + self._phase
+            )))
+
+        return {'elevation': eta, 'x': float(x), 'y': float(y)}
+
+
 # ---------------------------------------------------------------------------
 # Sensor generator orchestrator
 # ---------------------------------------------------------------------------
@@ -351,6 +406,11 @@ _SENSOR_FACTORY = {
         n_control_surfaces=kw.get('n_control_surfaces', 0),
         n_thrusters=kw.get('n_thrusters', 0),
         use_quaternion=kw.get('use_quaternion', False),
+    ),
+    'waveprobe': lambda cfg, **kw: LocalWaveProbeSensor(
+        cfg,
+        wave_environment=kw.get('wave_environment'),
+        gravity=kw.get('gravity', 9.80665),
     ),
 }
 
@@ -385,7 +445,8 @@ class LocalSensorGenerator:
 
     def __init__(self, vessel_config: dict, vessel_name: str = '',
                  use_quaternion: bool = False,
-                 on_measurement: Optional[Callable] = None):
+                 on_measurement: Optional[Callable] = None,
+                 wave_environment: Optional[dict] = None):
         """
         Args:
             vessel_config: Full agent config dict from handshake vesselConfig
@@ -393,6 +454,9 @@ class LocalSensorGenerator:
             use_quaternion: Whether the state uses quaternion (4) or euler (3) attitude
             on_measurement: Optional callback(sensor_type, topic, measurement) called
                            each time a sensor generates a new measurement
+            wave_environment: Session-wide wave component list (not per-vessel),
+                           consumed by any 'WaveProbe' sensor in this vessel's
+                           sensor list. See BaseController._wave_environment.
         """
         self.vessel_name = vessel_name
         self.use_quaternion = use_quaternion
@@ -417,6 +481,7 @@ class LocalSensorGenerator:
             n_control_surfaces=n_cs,
             n_thrusters=n_thr,
             use_quaternion=use_quaternion,
+            wave_environment=wave_environment,
         )
 
         self._sensors: List[Tuple[str, object, float]] = []  # (topic, sensor, period)
@@ -446,6 +511,7 @@ class LocalSensorGenerator:
         self._state: Optional[np.ndarray] = None
         self._state_der: Optional[np.ndarray] = None
         self._state_update_time: float = 0.0
+        self._sim_time: float = 0.0  # elapsed sim time at the last update, for time-dependent sensors (e.g. wave probe)
         self._latest: Dict[str, dict] = {}
         self._timers: List[threading.Timer] = []
         self._running = False
@@ -458,12 +524,15 @@ class LocalSensorGenerator:
     def sensor_topics(self) -> List[str]:
         return [topic for topic, _, _ in self._sensors]
 
-    def update_state(self, state: np.ndarray, state_der: Optional[np.ndarray] = None):
+    def update_state(self, state: np.ndarray, state_der: Optional[np.ndarray] = None,
+                     sim_time: Optional[float] = None):
         """Update the shared state arrays from incoming rosbridge data."""
         with self._lock:
             self._state = state.copy()
             if state_der is not None:
                 self._state_der = state_der.copy()
+            if sim_time is not None:
+                self._sim_time = sim_time
             self._state_update_time = time.monotonic()
 
     def get_latest_measurements(self) -> Dict[str, dict]:
@@ -559,6 +628,7 @@ class LocalSensorGenerator:
             state = self._state
             state_der = self._state_der
             update_t = self._state_update_time
+            sim_time_at_update = self._sim_time
 
         if state is None:
             return
@@ -568,10 +638,15 @@ class LocalSensorGenerator:
         # Dead-reckon forward from last update to "now"
         dt = time.monotonic() - update_t
         interp_state, interp_der = self._interpolate_state(state, state_der, dt)
+        # Sim time advances at the same rate as wall-clock time once running,
+        # so this simple linear extrapolation matches how position/attitude
+        # are already dead-reckoned above.
+        interp_sim_time = sim_time_at_update + dt
 
         try:
             measurement = sensor.get_measurement(
-                interp_state, interp_der, use_quaternion=self.use_quaternion
+                interp_state, interp_der, use_quaternion=self.use_quaternion,
+                sim_time=interp_sim_time,
             )
             with self._lock:
                 self._latest[topic] = measurement
@@ -581,14 +656,17 @@ class LocalSensorGenerator:
             logger.debug(f"Sensor generation error for {topic}: {e}")
 
     def generate_once(self, state: np.ndarray,
-                      state_der: Optional[np.ndarray] = None) -> Dict[str, dict]:
+                      state_der: Optional[np.ndarray] = None,
+                      sim_time: float = 0.0) -> Dict[str, dict]:
         """One-shot: generate all sensor measurements for the given state."""
         if state_der is None:
             state_der = np.zeros_like(state)
         results = {}
         for topic, sensor, _ in self._sensors:
             try:
-                m = sensor.get_measurement(state, state_der, use_quaternion=self.use_quaternion)
+                m = sensor.get_measurement(
+                    state, state_der, use_quaternion=self.use_quaternion, sim_time=sim_time
+                )
                 results[topic] = m
             except Exception as e:
                 logger.debug(f"Sensor error for {topic}: {e}")
