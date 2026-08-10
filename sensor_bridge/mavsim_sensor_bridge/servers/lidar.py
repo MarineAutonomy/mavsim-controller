@@ -330,8 +330,14 @@ class LidarSensorServer(BaseSensorServer):
         lidar scan counts so you can check if any data is arriving on the WebSocket.
         
         Returns:
-            Dict with 'messages', 'bytes', 'connections', 'total_scans',
-            and 'scans_per_vessel' (e.g. {"1": 150, "2": 0}).
+            Dict with 'messages', 'bytes', 'connections', 'total_scans', and
+            'scans_per_sensor', keyed "<vessel_id>:<lidar_id>" (e.g.
+            {"1:0": 150, "1:1": 0}) - a vessel can carry more than one lidar.
+
+            This said 'scans_per_vessel' keyed by vessel alone until
+            2026-08-07, while the code below had already moved to per-sensor
+            keys; two tests followed the docstring rather than the behaviour
+            and failed with KeyError.
         """
         base = super().get_stats()
         with self._stats_lock:

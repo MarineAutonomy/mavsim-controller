@@ -337,7 +337,10 @@ async def test_lidar_bridge_stats():
         assert stats['messages'] == 10, f"Expected 10 messages, got {stats['messages']}"
         assert stats['bytes'] > 0
         assert stats['total_scans'] == 10
-        assert stats['scans_per_vessel']['1'] == 10
+        # Per-sensor key "<vessel>:<lidar>"; pack_lidar_scan defaults lidar_id=0.
+        # Was scans_per_vessel['1'], which get_stats() no longer returns. Not
+        # caught earlier because this suite needs a live bridge and is not in CI.
+        assert stats['scans_per_sensor']['1:0'] == 10
 
     await _run_with_bridge(body)
 

@@ -1,0 +1,85 @@
+name: CI
+
+# Tests only. This repository is what users clone to run the bridge, so the
+# thing worth protecting is that a fresh clone works - not that it deploys
+# anywhere. Publishing mavlab/mavsim-controller:latest stays manual (./build.sh
+# --push).
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: Tests
+    runs-on: ubuntu-latest
+    # A hard cap, because the failure mode this suite actually had was a hang,
+    # not a failure: sensor_bridge's test_bridge_no_servers_enabled awaited a
+    # start() that never returns, and pytest sat there indefinitely. Left
+    # uncapped, a repeat would burn the full 6h job limit and report nothing.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # Matches ros:humble's Python, which is what the image runs.
+          python-version: '3.10'
+          cache: pip
+          cache-dependency-path: core/requirements.txt
+
+      - name: Install dependencies
+        run: |
+          pip install pytest pytest-asyncio pytest-mock
+          pip install -r core/requirements.txt
+          pip install ./sensor_bridge
+
+      - name: Teleop tests
+        run: python -m pytest teleop/tests -q
+
+      - name: Sensor bridge unit tests
+        # 133 tests. Every one of these was unreachable before 2026-08-07:
+        # the suite hung indefinitely on test_bridge_no_servers_enabled, so it
+        # could never have been run to completion, in CI or by hand.
+        run: python -m pytest sensor_bridge/tests/unit -q
+
+      - name: Bridge core unit tests
+        # 27 pass, 5 skip. test_polling_starts_on_connect is excluded: it calls
+        # BaseController.connect(), which does a real HTTP request to
+        # localhost:5000 and fails with connection refused when no backend is
+        # running. Its mocking is incomplete rather than its subject being
+        # untestable ('Mock' object is not iterable also surfaces), so this is a
+        # test to fix, not a permanent exclusion.
+        run: |
+          python -m pytest core/tests/unit -q \
+            --deselect core/tests/unit/test_task_2_1_polling.py::TestRecordingPolling::test_polling_starts_on_connect
+
+  docker-build:
+    name: Docker image builds
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # The consolidation moved interfaces/ and sensor_bridge/ into this repo and
+    # retargeted every COPY path and the build context. Nothing else here would
+    # notice if one of those paths broke - the tests import from the source
+    # tree, not the image - and the break would surface only when someone ran
+    # ./build.sh, or worse, on a `docker pull` of a bad :latest.
+    #
+    # Build only; publishing stays manual.
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

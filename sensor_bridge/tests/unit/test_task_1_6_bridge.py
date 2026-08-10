@@ -271,13 +271,21 @@ async def test_bridge_stats_after_receiving_data():
 
 @pytest.mark.asyncio
 async def test_bridge_no_servers_enabled():
-    """Test that bridge handles case when no servers are enabled."""
-    config = BridgeConfig(camera_enabled=False)
+    """Test that bridge handles case when no servers are enabled.
+
+    Both flags must be off. lidar_enabled defaults to True, so disabling only
+    the camera left a lidar server configured, which meant start() skipped its
+    `if not self._servers: return` early exit and instead blocked forever -
+    exactly as its docstring says it does ("will block until stop() is
+    called"). stop() below was unreachable, and the whole suite hung on this
+    test indefinitely rather than failing.
+    """
+    config = BridgeConfig(camera_enabled=False, lidar_enabled=False)
     bridge = SensorBridge(config=config)
-    
+
     # Should not crash when starting with no servers
     await bridge.start()
-    
+
     # Should be able to stop
     await bridge.stop()
 

@@ -413,7 +413,11 @@ async def test_lidar_server_stats():
             assert stats['bytes'] > 0  # Should have received bytes
             assert stats['connections'] == 1  # Connection still open
             assert stats['total_scans'] == 5
-            assert stats['scans_per_vessel']['1'] == 5
+            # get_stats() reports per-sensor ("<vessel>:<lidar>"), not per-vessel;
+            # pack_lidar_scan above defaults lidar_id=0, hence "1:0". This read
+            # scans_per_vessel['1'] and raised KeyError - the counters moved to
+            # per-sensor granularity and this assertion was never updated.
+            assert stats['scans_per_sensor']['1:0'] == 5
         
         # Wait for connection cleanup after context manager exits
         await asyncio.sleep(0.2)
