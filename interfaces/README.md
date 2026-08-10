@@ -1,5 +1,13 @@
 # `interfaces` ROS2 package
 
+> **Keep in sync with mavsim.** These `.msg` files are the wire format between
+> the simulator and this bridge, so they are a vendored copy of
+> `ros2_ws/src/interfaces` in the mavsim repo, not an independent definition.
+> A CI job there fails if the two diverge. Change them upstream, then re-vendor
+> — editing only this copy is what previously left `WaveProbe.msg` missing here
+> while the bridge imported it, silently disabling wave-probe publishing for
+> anyone who built from this directory.
+
 This is the message package your controller needs to **send actuator commands**
 to the mavsim bridge. It defines:
 
@@ -7,6 +15,7 @@ to the mavsim bridge. It defines:
 |---------|----------|
 | `interfaces/Actuator` | actuator commands (`/<vessel>/actuator_cmd`) and, with `--observe-others`, observed actuator state (`/<vessel>/actuator_state`) |
 | `interfaces/DVL` | the DVL sensor message (only relevant if you consume DVL data) |
+| `interfaces/WaveProbe` | the wave-probe sensor message (wave surface elevation at a world-frame point) |
 
 `interfaces/Actuator`:
 
