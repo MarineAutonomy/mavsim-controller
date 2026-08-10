@@ -532,6 +532,55 @@ class MavsimAPIClient:
 # Roslib Subscriber
 # =============================================================================
 
+_sni_patch_applied = False
+
+
+def _ensure_roslibpy_sends_sni():
+    """
+    Make roslibpy's wss:// connections send an SNI server_name extension.
+
+    autobahn's connectWS() falls back to twisted's legacy
+    ssl.ClientContextFactory() when no contextFactory is passed, and roslibpy
+    never passes one. That legacy context sends no SNI, which is fatal against
+    the hosted deployment: CloudFront is configured sni-only
+    (infra/terraform/frontend.tf), so it answers a handshake with no
+    server_name with a TLS alert 40 rather than a certificate. The symptom is
+    silent - connect() below just retries until its 90s deadline and gives up,
+    and the bridge comes up with no ROS2 topics at all.
+
+    Patching the module-level connectWS symbol (rather than the factory) is
+    what makes this take effect: roslibpy.Ros.__init__ calls self.connect()
+    during construction, which queues the *bound* factory._connect through
+    reactor.callFromThread before any caller gets the object back. Overriding
+    factory._connect afterwards is therefore too late and silently does
+    nothing, while _connect's own `connectWS(self)` is a module-global lookup
+    resolved at call time - i.e. after this patch is in place.
+
+    optionsForClientTLS also verifies the certificate chain against the
+    system trust store, which ClientContextFactory did not do at all.
+    """
+    global _sni_patch_applied
+    if _sni_patch_applied:
+        return
+    try:
+        import roslibpy.comm.comm_autobahn as comm_autobahn
+        from twisted.internet import ssl as twisted_ssl
+    except ImportError:
+        # Non-autobahn roslibpy backend (or roslibpy absent) - connect() below
+        # reports the missing dependency on its own.
+        return
+
+    original_connect_ws = comm_autobahn.connectWS
+
+    def connect_ws_with_sni(factory, contextFactory=None, *args, **kwargs):
+        if contextFactory is None and getattr(factory, 'isSecure', False):
+            contextFactory = twisted_ssl.optionsForClientTLS(factory.host)
+        return original_connect_ws(factory, contextFactory, *args, **kwargs)
+
+    comm_autobahn.connectWS = connect_ws_with_sni
+    _sni_patch_applied = True
+
+
 class RoslibSubscriber:
     """
     WebSocket subscriber for ROS topics via rosbridge.
@@ -599,7 +648,11 @@ class RoslibSubscriber:
         except ImportError:
             logger.error("roslibpy not installed. Install with: pip install roslibpy")
             return False
-        
+
+        # Must happen before roslibpy.Ros() below - see the function's docstring
+        # on why constructing Ros already commits to a connection attempt.
+        _ensure_roslibpy_sends_sni()
+
         # In external-controller "wait_mode=all", rosbridge may come up only after
         # the final controller handshakes. Keep retrying across that startup window.
         timeout = 90.0
@@ -662,7 +715,18 @@ class RoslibSubscriber:
             url = f'ws://{url}'
         parsed = urlparse(url)
         host = parsed.hostname or 'localhost'
-        port = parsed.port or 9090
+        # A hosted wss:// URL carries no explicit port and is served on 443.
+        # setSessionParameters() in connect() re-derives the port anyway
+        # whenever has_path is set, but only then - defaulting every portless
+        # URL to 9090 would otherwise build a factory pointing at a port
+        # nothing listens on. ws:// keeps the 9090 default: that is rosbridge's
+        # own port, and every local/direct URL in this codebase is ws://.
+        if parsed.port:
+            port = parsed.port
+        elif parsed.scheme == 'wss':
+            port = 443
+        else:
+            port = 9090
         has_path = bool(parsed.path and parsed.path not in ('', '/'))
         return host, port, has_path
     
