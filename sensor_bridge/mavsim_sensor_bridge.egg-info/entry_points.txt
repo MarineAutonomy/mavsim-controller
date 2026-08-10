@@ -1,0 +1,2 @@
+[console_scripts]
+mavsim-sensor-bridge = mavsim_sensor_bridge.cli:main
