@@ -216,3 +216,16 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ---------------------------------------------------------------------------
+# mavsim-controller specifics (carried over from user_repo_new/.gitignore)
+# ---------------------------------------------------------------------------
+
+# Recorded bags are runtime artifacts, and large - the source workspace
+# accumulated 66 MB of them. Only the directory itself is tracked.
+recordings/*
+!recordings/.gitkeep
+
+# Downloaded session tokens carry a live api_token granting control of a
+# running simulation. This repo is public; never let one be committed.
+*token*.json

@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MAVSim Camera Viewer</title>
+    <style>
+        *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            background: #0f1117;
+            color: #c8ccd4;
+            font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        header {
+            background: #181a20;
+            padding: 10px 20px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            border-bottom: 1px solid #2a2d35;
+            flex-shrink: 0;
+        }
+
+        .title { font-size: 16px; font-weight: 600; color: #61afef; letter-spacing: 0.3px; }
+
+        .stats { display: flex; gap: 20px; font-size: 12px; }
+
+        .stat { display: flex; align-items: center; gap: 5px; }
+        .stat-label { color: #5c6370; text-transform: uppercase; font-size: 10px; letter-spacing: 0.5px; }
+        .stat-value { font-weight: 600; font-variant-numeric: tabular-nums; min-width: 36px; }
+
+        .indicator { width: 7px; height: 7px; border-radius: 50%; background: #e06c75; transition: background 0.3s; }
+        .indicator.live { background: #98c379; }
+
+        .status-text { font-weight: 500; font-size: 12px; }
+        .status-text.live { color: #98c379; }
+        .status-text.waiting { color: #e5c07b; }
+        .status-text.error { color: #e06c75; }
+
+        .viewer {
+            flex: 1;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: #0a0b0e;
+            overflow: hidden;
+        }
+
+        .viewer img { max-width: 100%; max-height: 100%; object-fit: contain; border-radius: 2px; }
+
+        .placeholder { text-align: center; color: #3e4452; }
+        .placeholder .icon { font-size: 48px; margin-bottom: 12px; opacity: 0.5; }
+        .placeholder p { font-size: 14px; line-height: 1.6; }
+        .placeholder .hint { font-size: 11px; color: #2c313a; margin-top: 12px; }
+
+        .config-bar {
+            background: #181a20;
+            padding: 8px 20px;
+            border-top: 1px solid #2a2d35;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            font-size: 12px;
+            flex-shrink: 0;
+        }
+
+        .config-bar label { color: #5c6370; font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px; }
+
+        .config-bar input[type="text"],
+        .config-bar select {
+            background: #21252b;
+            border: 1px solid #2a2d35;
+            color: #abb2bf;
+            padding: 5px 10px;
+            border-radius: 4px;
+            font-family: 'Consolas', 'Fira Code', monospace;
+            font-size: 12px;
+            outline: none;
+            transition: border-color 0.2s;
+        }
+        .config-bar input[type="text"]:focus,
+        .config-bar select:focus { border-color: #61afef; }
+
+        .btn {
+            background: #2a2d35;
+            border: 1px solid #363a43;
+            color: #abb2bf;
+            padding: 5px 14px;
+            border-radius: 4px;
+            font-size: 11px;
+            cursor: pointer;
+            transition: background 0.15s, border-color 0.15s;
+        }
+        .btn:hover { background: #363a43; border-color: #4b5263; }
+
+        .spacer { flex: 1; }
+        .resolution { color: #5c6370; font-size: 11px; font-variant-numeric: tabular-nums; }
+    </style>
+</head>
+<body>
+    <header>
+        <span class="title">MAVSim Camera Viewer</span>
+        <div class="stats">
+            <div class="stat">
+                <div class="indicator" id="indicator"></div>
+                <span class="stat-value status-text waiting" id="statusText">Waiting</span>
+            </div>
+            <div class="stat">
+                <span class="stat-label">FPS</span>
+                <span class="stat-value" id="fps">--</span>
+            </div>
+            <div class="stat">
+                <span class="stat-label">Frames</span>
+                <span class="stat-value" id="frameCount">0</span>
+            </div>
+            <div class="stat">
+                <span class="stat-label">Size</span>
+                <span class="stat-value" id="frameSize">--</span>
+            </div>
+        </div>
+    </header>
+
+    <div class="viewer">
+        <img id="feed" alt="" style="display:none" />
+        <div class="placeholder" id="placeholder">
+            <div class="icon">&#x1F3A5;</div>
+            <p>Waiting for camera feed&hellip;</p>
+            <p class="hint">
+                Start the bridge with --enable-sensors,<br>
+                then begin a simulation in the web platform.
+            </p>
+        </div>
+    </div>
+
+    <div class="config-bar">
+        <label>Server</label>
+        <input type="text" id="serverUrl" size="30" />
+        <button class="btn" onclick="applyUrl()">Connect</button>
+
+        <label style="margin-left:12px">Camera</label>
+        <select id="cameraSelect" onchange="selectCamera()">
+            <option value="">Scanning&hellip;</option>
+        </select>
+
+        <span class="spacer"></span>
+        <span class="resolution" id="resolution"></span>
+    </div>
+
+    <script>
+        /* ---- Configuration ---- */
+        const params  = new URLSearchParams(location.search);
+        const host    = params.get('host') || 'localhost';
+        const port    = params.get('port') || '8888';
+        let   baseUrl = `http://${host}:${port}`;
+
+        document.getElementById('serverUrl').value = baseUrl;
+
+        /* ---- DOM refs ---- */
+        const img         = document.getElementById('feed');
+        const placeholder = document.getElementById('placeholder');
+        const indicator   = document.getElementById('indicator');
+        const statusText  = document.getElementById('statusText');
+        const fpsEl       = document.getElementById('fps');
+        const countEl     = document.getElementById('frameCount');
+        const sizeEl      = document.getElementById('frameSize');
+        const resEl       = document.getElementById('resolution');
+        const urlInput    = document.getElementById('serverUrl');
+        const camSelect   = document.getElementById('cameraSelect');
+
+        /* ---- State ---- */
+        let totalFrames = 0;
+        let fpsFrames   = 0;
+        let lastFpsTick = performance.now();
+        let connected   = false;
+        let prevBlob    = null;
+        let selected    = null;   // { v, c }
+        let lastFrameId = null;   // X-Frame-Mtime of last shown frame
+
+        /* ---- Actions ---- */
+        function applyUrl() {
+            baseUrl = urlInput.value.replace(/\/+$/, '');
+            setStatus('waiting');
+        }
+        urlInput.addEventListener('keydown', e => { if (e.key === 'Enter') applyUrl(); });
+
+        function selectCamera() {
+            const val = camSelect.value;
+            lastFrameId = null;
+            if (!val) {
+                selected = null;
+                img.style.display = 'none';
+                placeholder.style.display = '';
+                setStatus('waiting');
+                return;
+            }
+            const [v, c] = val.split('_');
+            selected = { v, c };
+        }
+
+        function setStatus(state) {
+            indicator.className = 'indicator' + (state === 'live' ? ' live' : '');
+            statusText.className = 'stat-value status-text ' + state;
+            statusText.textContent = state === 'live' ? 'Live'
+                                   : state === 'waiting' ? 'Waiting'
+                                   : 'Disconnected';
+            connected = state === 'live';
+        }
+
+        function formatBytes(n) {
+            return n < 1024 ? n + ' B' : (n / 1024).toFixed(1) + ' KB';
+        }
+
+        /* ---- Camera list polling ---- */
+        async function refreshCameraList() {
+            try {
+                const res = await fetch(`${baseUrl}/api/camera/list`);
+                if (!res.ok) return;
+                const data = await res.json();
+                const prev = camSelect.value;
+                const firstLoad = camSelect.options.length === 0
+                    || (camSelect.options.length === 1 && camSelect.options[0].value === '');
+                if (!data.cameras.length) {
+                    camSelect.innerHTML = '<option value="">None (off)</option>';
+                    selected = null;
+                    return;
+                }
+                camSelect.innerHTML = '<option value="">None (off)</option>'
+                    + data.cameras.map(c =>
+                        `<option value="${c.vessel_id}_${c.camera_id}">Vessel ${c.vessel_id} \u2013 Camera ${c.camera_id}</option>`
+                    ).join('');
+                if (!firstLoad && [...camSelect.options].some(o => o.value === prev)) {
+                    camSelect.value = prev;
+                } else {
+                    camSelect.value = `${data.cameras[0].vessel_id}_${data.cameras[0].camera_id}`;
+                }
+                selectCamera();
+            } catch {}
+        }
+
+        /* ---- Frame polling ---- */
+        async function poll() {
+            if (selected) {
+                try {
+                    const r = await fetch(
+                        `${baseUrl}/api/camera/frame?v=${selected.v}&c=${selected.c}`,
+                        { cache: 'no-store' }
+                    );
+                    if (r.ok && r.status === 200) {
+                        const fid = r.headers.get('X-Frame-Mtime');
+                        // Only count genuinely new frames (true FPS), not every poll.
+                        if (fid === null || fid !== lastFrameId) {
+                            const blob = await r.blob();
+                            if (blob.size > 0) {
+                                lastFrameId = fid;
+                                const url = URL.createObjectURL(blob);
+                                img.src = url;
+                                img.style.display = 'block';
+                                placeholder.style.display = 'none';
+                                if (prevBlob) URL.revokeObjectURL(prevBlob);
+                                prevBlob = url;
+
+                                totalFrames++;
+                                fpsFrames++;
+                                countEl.textContent = totalFrames;
+                                sizeEl.textContent = formatBytes(blob.size);
+
+                                if (!connected) setStatus('live');
+                            }
+                        }
+                    }
+                } catch {
+                    if (connected) setStatus('error');
+                }
+            }
+
+            const now = performance.now();
+            if (now - lastFpsTick >= 1000) {
+                fpsEl.textContent = fpsFrames;
+                fpsFrames = 0;
+                lastFpsTick = now;
+            }
+
+            setTimeout(poll, connected ? 60 : 1000);
+        }
+
+        img.addEventListener('load', () => {
+            if (img.naturalWidth) resEl.textContent = `${img.naturalWidth} \u00d7 ${img.naturalHeight}`;
+        });
+
+        /* ---- Start ---- */
+        refreshCameraList();
+        setInterval(refreshCameraList, 3000);
+        poll();
+    </script>
+</body>
+</html>
