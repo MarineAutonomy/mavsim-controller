@@ -69,7 +69,12 @@ DOCKER_IMAGE="mavlab/mavsim-controller:latest"
 CONTAINER_NAME="mavsim-bridge-$$"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# The repository root is this directory. This was "$SCRIPT_DIR/.." while the
+# script lived in the mavsim repo as user_repo_new/, where the Docker build
+# context had to reach sensor_bridge/ and ros2_ws/src/interfaces/ outside it.
+# Only --build reads this, so a stale ".." would not fail until someone built
+# locally - and would then hand Docker the parent of the whole checkout.
+REPO_ROOT="$SCRIPT_DIR"
 
 DEFAULT_BACKEND_URL="http://localhost:5000"
 DEFAULT_FRONTEND_URL="http://localhost:5173"
@@ -168,14 +173,14 @@ fi
 
 if [ ! -f "$BRIDGE_FILE" ]; then
     print_error "bridge_controller.py not found next to start.sh ($BRIDGE_FILE)"
-    print_error "Re-clone user_repo_new or restore bridge_controller.py."
+    print_error "Re-clone this repository or restore bridge_controller.py."
     exit 1
 fi
 
 for f in "${CORE_FILES[@]}"; do
     if [ ! -f "$CORE_DIR/$f" ]; then
         print_error "$f not found under $CORE_DIR"
-        print_error "Re-clone user_repo_new or restore user_repo_new/core/."
+        print_error "Re-clone this repository or restore core/."
         exit 1
     fi
 done
@@ -183,7 +188,7 @@ done
 for f in "${TELEOP_FILES[@]}"; do
     if [ ! -f "$TELEOP_DIR/$f" ]; then
         print_error "$f not found under $TELEOP_DIR"
-        print_error "Re-clone user_repo_new or restore user_repo_new/teleop/."
+        print_error "Re-clone this repository or restore teleop/."
         exit 1
     fi
 done

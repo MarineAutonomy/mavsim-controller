@@ -1,17 +1,22 @@
-# Dockerfile for the mavsim ROS2 bridge (user_repo_new)
+# Dockerfile for the mavsim ROS2 bridge
 # Multi-platform build supporting Linux, macOS, and Windows
 #
-# Produces mavlab/mavsim-controller:latest - build context is the repository
-# root (parent of user_repo_new/), since this also needs ros2_ws/src/interfaces
-# and sensor_bridge/, which live outside user_repo_new/. Build with:
-#   docker build -f user_repo_new/Dockerfile -t mavlab/mavsim-controller:latest .
-# (from repo root), or just run user_repo_new/build.sh.
+# Produces mavlab/mavsim-controller:latest. Build context is this repository's
+# root - everything the image needs (interfaces/, sensor_bridge/, core/,
+# teleop/) now lives here. Build with:
+#   docker build -t mavlab/mavsim-controller:latest .
+# or just run ./build.sh.
+#
+# This used to build from the mavsim repo root, because interfaces/ and
+# sensor_bridge/ lived outside the bridge directory and the source was
+# duplicated between the two repos. That duplication is what let the copies
+# drift apart silently; see interfaces/README.md.
 #
 # The actual bridge/controller logic (base_controller.py, python_controller.py,
 # run_controller.py, observer.py, visualizer_server.py, recording_service.py,
-# local_sensor_generator.py) lives under user_repo_new/core/ and is baked in
+# local_sensor_generator.py) lives under core/ and is baked in
 # below as a fallback for a bare `docker pull` + hand-rolled `docker run` -
-# user_repo_new/start.sh/start.bat bind-mount the same files from a live
+# start.sh/start.bat bind-mount the same files from a live
 # checkout on top of these, so local edits take effect on a container
 # restart without needing to rebuild this image.
 
@@ -24,7 +29,7 @@ WORKDIR /app
 # Install rosbag2, MCAP storage (for client-side recording), and build tools
 #
 # libegl1: provides libEGL.so.1, the vendor-neutral EGL loader. Without it,
-# GPU-accelerated headless Chromium (see user_repo_new/core/observer.py)
+# GPU-accelerated headless Chromium (see core/observer.py)
 # fails to initialize even when NVIDIA's own EGL driver (libEGL_nvidia.so,
 # injected by `docker run --gpus all` via nvidia-container-toolkit) is
 # present - ANGLE calls dlopen("libEGL.so.1") directly and there's nothing
@@ -45,12 +50,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # ROS2 environment is already set up in base image
 ENV ROS_DISTRO=humble
 
-# Copy interfaces package (custom message types) - always from ros2_ws/src,
-# NEVER from user_repo_new/interfaces/ (a separate, divergent reference copy
-# for external users building their own ROS2 packages - different content,
-# not interchangeable with this one).
+# Copy interfaces package (custom message types). There is now exactly one
+# copy: interfaces/ in this repo, vendored from mavsim's ros2_ws/src/interfaces
+# and held equal to it by a CI drift check there.
+#
+# This previously read "always from ros2_ws/src, NEVER from
+# user_repo_new/interfaces/ (a separate, divergent reference copy ... not
+# interchangeable with this one)" - i.e. the package baked into the image and
+# the one users were told to build against were knowingly different. That is
+# how WaveProbe.msg ended up missing from the users' copy while the bridge
+# imports it behind `except ImportError: pass`, silently disabling wave-probe
+# publishing for anyone who followed the docs.
 RUN mkdir -p /ros2_ws/src
-COPY ros2_ws/src/interfaces /ros2_ws/src/interfaces
+COPY interfaces /ros2_ws/src/interfaces
 
 # Build interfaces package
 WORKDIR /ros2_ws
@@ -65,8 +77,6 @@ RUN echo "source /opt/ros/humble/setup.bash" >> /root/.bashrc && \
 WORKDIR /app
 
 # Copy sensor bridge package and install it
-# Note: Build context should be repository root (parent of user_repo_new/)
-# Copy the entire sensor_bridge package structure
 COPY sensor_bridge/pyproject.toml /app/sensor_bridge_setup/
 COPY sensor_bridge/mavsim_sensor_bridge /app/sensor_bridge_setup/mavsim_sensor_bridge
 
@@ -75,7 +85,7 @@ RUN cd /app/sensor_bridge_setup && pip install --no-cache-dir . || \
     echo "Warning: sensor_bridge installation failed, continuing..."
 
 # Copy requirements first for better layer caching
-COPY user_repo_new/core/requirements.txt .
+COPY core/requirements.txt .
 
 # Install Python dependencies (including test dependencies)
 RUN pip install --no-cache-dir -r requirements.txt && \
@@ -93,31 +103,31 @@ RUN pip install --no-cache-dir playwright && \
 
 # Copy bridge core infrastructure (all connection/handshake/recording code).
 # Baked in as a fallback only - start.sh/start.bat bind-mount these same
-# files from user_repo_new/core/ at `docker run` time, which take precedence
+# files from core/ at `docker run` time, which take precedence
 # over what's copied here, so routine code changes don't need a rebuild.
-COPY user_repo_new/core/python_controller.py .
-COPY user_repo_new/core/base_controller.py .
-COPY user_repo_new/core/run_controller.py .
-COPY user_repo_new/core/recording_service.py .
-COPY user_repo_new/core/local_sensor_generator.py .
-COPY user_repo_new/core/observer.py .
+COPY core/python_controller.py .
+COPY core/base_controller.py .
+COPY core/run_controller.py .
+COPY core/recording_service.py .
+COPY core/local_sensor_generator.py .
+COPY core/observer.py .
 
 # Local ROS2 topic visualizer: a standalone Flask app + rosbridge websocket,
 # both launched as subprocesses of base_controller.py in every mode
 # (CLI/web/token), so a browser can inspect the local ROS2 topics (time
 # histories, camera, point cloud, camera+lidar overlay) even when the user
 # only has SSH/browser access and no rviz2/X11.
-COPY user_repo_new/core/visualizer_server.py .
-COPY user_repo_new/core/vendor/three.min.js /app/static/three.min.js
+COPY core/visualizer_server.py .
+COPY core/vendor/three.min.js /app/static/three.min.js
 
 # Keyboard teleop (plans/plan_teleop.md): an rclpy node that publishes
 # interfaces/Actuator commands on /<vessel>/actuator_cmd from browser
 # keypresses, plus its own page/WebSocket server - launched as a subprocess
 # of base_controller.py the same way as rosbridge/visualizer above. Flat
 # into /app (not a package), matching every other core script - start.sh
-# bind-mounts the same files from user_repo_new/teleop/ on top of these.
-COPY user_repo_new/teleop/allocation.py .
-COPY user_repo_new/teleop/teleop_node.py .
+# bind-mounts the same files from teleop/ on top of these.
+COPY teleop/allocation.py .
+COPY teleop/teleop_node.py .
 
 # Expose sensor bridge ports for vessel *
 # 70*1: Camera
@@ -162,7 +172,7 @@ RUN echo '#!/bin/bash' > /app/entrypoint.sh && \
     chmod +x /app/entrypoint.sh
 
 # Copy test files into container (for running tests)
-COPY user_repo_new/core/tests /app/tests
+COPY core/tests /app/tests
 
 # Default entrypoint: auto-discovers and runs client's my_controller.py
 # Client mounts their code as: -v ./bridge_controller.py:/app/user_code/my_controller.py

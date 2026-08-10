@@ -59,16 +59,17 @@ if ! command -v docker &> /dev/null; then
     exit 1
 fi
 
-# Get the directory where this script is located (user_repo_new/)
+# Get the directory where this script is located - which is now the repository
+# root. This read `ROOT_DIR="$SCRIPT_DIR/.."` while this lived in the mavsim
+# repo as user_repo_new/, because the build context had to be mavsim's root to
+# reach sensor_bridge/ and ros2_ws/src/interfaces/. Both now live in this repo,
+# so the context is simply here - and leaving the `..` in place would silently
+# hand Docker the parent directory of the whole checkout as build context.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# Get repository root (parent of user_repo_new directory)
-ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+ROOT_DIR="$SCRIPT_DIR"
 
 # Build for multiple platforms (Linux AMD64, ARM64)
 # Note: Multi-platform builds require Docker Buildx
-# Note: Build context is repository root - user_repo_new/Dockerfile also
-# needs sensor_bridge/ and ros2_ws/src/interfaces/, which live outside
-# user_repo_new/ (see the Dockerfile's own header comment).
 print_info "Building Docker image: ${IMAGE_NAME}:${TAG}"
 print_info "Build context: ${ROOT_DIR} (repository root)"
 print_info "Dockerfile: ${SCRIPT_DIR}/Dockerfile"

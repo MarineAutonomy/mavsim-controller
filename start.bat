@@ -68,7 +68,11 @@ set "DOCKER_IMAGE=mavlab/mavsim-controller:latest"
 set "CONTAINER_NAME=mavsim-bridge-%RANDOM%"
 set "SCRIPT_DIR=%~dp0"
 if "%SCRIPT_DIR:~-1%"=="\" set "SCRIPT_DIR=%SCRIPT_DIR:~0,-1%"
-for %%I in ("%SCRIPT_DIR%\..") do set "REPO_ROOT=%%~fI"
+REM The repository root is this directory. This was "%SCRIPT_DIR%\.." while
+REM the script lived in the mavsim repo as user_repo_new/, where the Docker
+REM build context had to reach sensor_bridge/ and ros2_ws/src/interfaces/
+REM outside it. Only --build reads this.
+set "REPO_ROOT=%SCRIPT_DIR%"
 
 set "DEFAULT_BACKEND_URL=http://localhost:5000"
 set "DEFAULT_FRONTEND_URL=http://localhost:5173"
