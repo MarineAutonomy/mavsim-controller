@@ -120,6 +120,46 @@ _PAGE_HTML = """<!DOCTYPE html>
     background:rgba(15,17,23,.7);padding:4px 8px;border-radius:4px;}
   label.inline{font-size:.8rem;color:var(--text2);display:flex;align-items:center;gap:6px;}
   .readout{font-family:var(--mono);font-size:.82rem;line-height:1.7;}
+
+  /* ---- Topic Inspector ---- */
+  .insp-layout{display:grid;grid-template-columns:300px 1fr;gap:18px;align-items:start;}
+  @media (max-width:1000px){.insp-layout{grid-template-columns:1fr;}}
+  .insp-meta{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:14px;}
+  .insp-meta .cell{background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);padding:8px 12px;}
+  .insp-meta .k{font-size:.68rem;color:var(--text2);text-transform:uppercase;letter-spacing:.5px;}
+  .insp-meta .v{font-family:var(--mono);font-size:.85rem;margin-top:3px;word-break:break-all;}
+  .insp-meta .v.big{font-size:1.05rem;color:var(--accent);}
+  .field-list{max-height:420px;overflow-y:auto;border:1px solid var(--border);border-radius:var(--radius);
+    background:var(--bg);padding:6px;}
+  .field-list .fl-row{display:flex;align-items:center;gap:7px;padding:3px 5px;border-radius:4px;font-size:.78rem;
+    font-family:var(--mono);cursor:pointer;}
+  .field-list .fl-row:hover{background:var(--surface2);}
+  .field-list .fl-row input{accent-color:var(--accent);cursor:pointer;flex-shrink:0;margin:0;}
+  .field-list .fl-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .field-list .fl-type{color:var(--text2);font-size:.68rem;flex-shrink:0;}
+  .field-list .fl-derived{color:var(--warning);}
+  .field-list .fl-plottable .fl-name{color:var(--text);}
+  .field-list .fl-row.nonplot .fl-name{color:var(--text2);}
+  .fl-group{font-size:.68rem;color:var(--text2);text-transform:uppercase;letter-spacing:.5px;
+    padding:8px 5px 3px;border-top:1px solid var(--border);margin-top:5px;}
+  .fl-group:first-child{border-top:none;margin-top:0;}
+  .mini-btn{padding:4px 9px;font-size:.72rem;background:var(--surface2);color:var(--text);
+    border:1px solid var(--border);border-radius:5px;cursor:pointer;}
+  .mini-btn:hover{background:var(--border);}
+  .mini-btn.on{background:var(--accent);border-color:var(--accent);color:#fff;}
+  #rawTerm{background:#0a0c12;border:1px solid var(--border);border-radius:var(--radius);padding:10px 12px;
+    font-family:var(--mono);font-size:.75rem;line-height:1.55;height:300px;overflow-y:auto;
+    white-space:pre-wrap;word-break:break-word;color:var(--text2);user-select:text;}
+  #rawTerm .rl{border-bottom:1px solid rgba(45,51,72,.5);padding:3px 0;}
+  #rawTerm .rl:last-child{border-bottom:none;}
+  #rawTerm .rt{color:var(--accent);}
+  #rawTerm .rk{color:var(--text2);}
+  #rawTerm .rv{color:var(--success);}
+  #rawTerm .rs{color:var(--warning);}
+  canvas.plot{width:100%;height:300px;display:block;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);}
+  .num-in{width:64px;padding:4px 7px;border:1px solid var(--border);border-radius:5px;
+    background:var(--bg);color:var(--text);font-size:.8rem;outline:none;font-family:var(--mono);}
+  .insp-hint{font-size:.72rem;color:var(--text2);margin-top:8px;}
 </style>
 </head>
 <body>
@@ -132,6 +172,7 @@ _PAGE_HTML = """<!DOCTYPE html>
 </header>
 <div class="tabs">
   <div class="tab active" data-view="history" onclick="setView('history')">Time Histories</div>
+  <div class="tab" data-view="inspector" onclick="setView('inspector')">Topic Inspector</div>
   <div class="tab" data-view="camera" onclick="setView('camera')">Camera</div>
   <div class="tab" data-view="pointcloud" onclick="setView('pointcloud')">Point Cloud</div>
   <div class="tab" data-view="overlay" onclick="setView('overlay')">Overlay</div>
@@ -139,6 +180,62 @@ _PAGE_HTML = """<!DOCTYPE html>
 <main>
   <div class="view active" id="view-history">
     <div class="grid" id="historyGrid"><div class="empty-state">Waiting for sensor config&hellip;</div></div>
+  </div>
+  <div class="view" id="view-inspector">
+    <div class="toolbar">
+      <label class="inline" style="flex:1;min-width:280px;">Topic
+        <select id="inspTopicSelect" onchange="onInspectorTopicChange()" style="flex:1;min-width:240px;"></select>
+      </label>
+      <label class="inline"><input type="checkbox" id="inspAllVessels" onchange="populateInspectorTopics()"> Show internal topics</label>
+      <button class="mini-btn" onclick="refreshInspectorTopics()">Refresh</button>
+    </div>
+    <div class="insp-meta">
+      <div class="cell"><div class="k">Topic</div><div class="v" id="inspName">&ndash;</div></div>
+      <div class="cell"><div class="k">Type</div><div class="v" id="inspType">&ndash;</div></div>
+      <div class="cell"><div class="k">Rate</div><div class="v big" id="inspRate">&ndash;</div></div>
+      <div class="cell"><div class="k">Messages</div><div class="v" id="inspCount">0</div></div>
+    </div>
+    <div class="insp-layout">
+      <div class="panel">
+        <h3>Fields
+          <span style="display:flex;gap:5px;">
+            <button class="mini-btn" onclick="inspSetAllFields(true)">All</button>
+            <button class="mini-btn" onclick="inspSetAllFields(false)">None</button>
+          </span>
+        </h3>
+        <div class="field-list" id="inspFieldList">
+          <div class="empty-state">Waiting for first message&hellip;</div>
+        </div>
+        <div class="insp-hint">Checked fields appear in the raw feed and are available to plot.</div>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:18px;min-width:0;">
+        <div class="panel">
+          <h3>Raw Message
+            <span style="display:flex;gap:5px;align-items:center;">
+              <button class="mini-btn" id="rawPauseBtn" onclick="toggleRawPause()">Pause</button>
+              <button class="mini-btn on" id="rawScrollBtn" onclick="toggleRawScroll()">Autoscroll</button>
+              <button class="mini-btn" onclick="clearRawTerm()">Clear</button>
+            </span>
+          </h3>
+          <div id="rawTerm" readonly></div>
+          <div class="insp-hint">Read-only feed, throttled to <span id="rawThrottleLabel">10</span>/s &middot; last 200 messages retained.</div>
+        </div>
+        <div class="panel">
+          <h3>Plot
+            <span style="display:flex;gap:8px;align-items:center;">
+              <label class="inline">Window
+                <input type="number" class="num-in" id="plotWindow" value="20" min="1" max="600" step="1"
+                       onchange="onPlotWindowChange()"> s
+              </label>
+              <button class="mini-btn" id="plotPauseBtn" onclick="togglePlotPause()">Pause</button>
+            </span>
+          </h3>
+          <canvas class="plot" id="inspPlot"></canvas>
+          <div class="legend" id="inspPlotLegend"></div>
+          <div class="insp-hint" id="inspPlotHint">Check numeric fields on the left to plot them.</div>
+        </div>
+      </div>
+    </div>
   </div>
   <div class="view" id="view-camera">
     <div class="toolbar">
@@ -257,7 +354,7 @@ function initRos() {
     const el = $('#rosStatus');
     el.textContent = connected ? 'rosbridge: connected' : 'rosbridge: reconnecting…';
     el.className = 'status-badge ' + (connected ? 'connected' : 'disconnected');
-    if (connected) fetchLiveTopics(onVesselChange);
+    if (connected) fetchLiveTopics(() => { onVesselChange(); populateInspectorTopics(); });
   });
 }
 
@@ -734,12 +831,533 @@ function projectLidarToCamera(camSensor, lidarSensor, cloud, imgW, imgH) {
 }
 
 // ---------------------------------------------------------------------
+// Topic Inspector
+// ---------------------------------------------------------------------
+// A fully generic, type-agnostic topic browser: pick any live topic, see its
+// type and measured publish rate, watch raw messages scroll by in a read-only
+// terminal, and plot any numeric field against time on a sliding window.
+//
+// Nothing here is hardcoded per message type. The field tree is derived by
+// walking the FIRST received message (rosbridge hands us plain JSON), so it
+// works for interfaces/msg/Actuator just as well as for sensor_msgs/msg/Imu.
+// Two conveniences are layered on top of that walk:
+//   - uint8[] blobs (CompressedImage.data, PointCloud2.data) arrive as long
+//     base64 strings; they're summarised rather than dumped, so selecting a
+//     camera topic can't wedge the page.
+//   - any object exposing x/y/z/w is additionally offered as derived
+//     roll/pitch/yaw channels, since a quaternion is rarely what you actually
+//     want to look at on a chart.
+// ---------------------------------------------------------------------
+
+const RAW_MAX_LINES = 200;        // messages retained in the terminal
+const RAW_THROTTLE_HZ = 10;       // cap on terminal appends per second
+const PLOT_MAX_POINTS = 20000;    // hard cap on retained samples per channel
+
+// Internal/infrastructure topics: hidden unless "Show internal topics" is on.
+const INSP_HIDDEN_TOPICS = /^\/(rosout|parameter_events|client_count|connected_clients)$/;
+
+let inspTopic = null;          // currently inspected topic name
+let inspType = null;           // its ROS type string
+let inspSub = null;            // {topic, cb} for cleanup
+let inspFields = new Map();    // path -> {path, type, plottable, derived, checked}
+let inspFieldsBuilt = false;
+let inspSeries = new Map();    // path -> {t:[], v:[], color}
+let inspMsgCount = 0;
+let inspRateStamps = [];       // arrival times (ms) for the rate estimate
+let inspT0 = null;             // page-clock origin for plot x-axis
+let inspLastMsg = null;
+let rawPaused = false, rawAutoscroll = true, rawLastAppend = 0;
+let plotPaused = false, plotWindowSec = 20;
+let inspPlot = null;
+
+// --- field tree ------------------------------------------------------
+
+function isQuatLike(o) {
+  return o && typeof o === 'object' && !Array.isArray(o) &&
+         ['x', 'y', 'z', 'w'].every((k) => typeof o[k] === 'number');
+}
+
+// Walk a decoded message into a flat list of {path, type, plottable, derived}.
+// `path` is a dotted/bracketed accessor ("orientation.x", "data[3]") that
+// inspGetValue() below can resolve against any later message of the same type.
+function flattenMessage(obj, prefix, out, depth) {
+  depth = depth || 0;
+  if (depth > 6) return out;
+  for (const key of Object.keys(obj)) {
+    const val = obj[key];
+    const path = prefix ? `${prefix}.${key}` : key;
+    if (val === null || val === undefined) {
+      out.push({ path, type: 'null', plottable: false });
+    } else if (typeof val === 'number') {
+      // A float field that happens to hold 0.0/1.0 is still a float; the JSON
+      // wire format loses that distinction, so don't infer "int" from value.
+      out.push({ path, type: 'number', plottable: true });
+    } else if (typeof val === 'boolean') {
+      out.push({ path, type: 'bool', plottable: true });
+    } else if (typeof val === 'string') {
+      // Long strings are base64 uint8[] blobs in practice - summarise only.
+      out.push({ path, type: val.length > 256 ? `bytes[~${val.length}]` : 'string', plottable: false });
+    } else if (Array.isArray(val)) {
+      if (val.length && typeof val[0] === 'number') {
+        // Numeric array: expose each element, but cap how many get their own
+        // row so a 4096-point scan doesn't produce 4096 checkboxes.
+        const shown = Math.min(val.length, 64);
+        for (let i = 0; i < shown; i++) {
+          out.push({ path: `${path}[${i}]`, type: 'float', plottable: true });
+        }
+        if (val.length > shown) {
+          out.push({ path: `${path}[…]`, type: `+${val.length - shown} more`, plottable: false });
+        }
+      } else if (val.length && typeof val[0] === 'object') {
+        const shown = Math.min(val.length, 8);
+        for (let i = 0; i < shown; i++) flattenMessage(val[i], `${path}[${i}]`, out, depth + 1);
+        if (val.length > shown) {
+          out.push({ path: `${path}[…]`, type: `+${val.length - shown} more`, plottable: false });
+        }
+      } else {
+        out.push({ path, type: `array[${val.length}]`, plottable: false });
+      }
+    } else if (typeof val === 'object') {
+      flattenMessage(val, path, out, depth + 1);
+      // Offer euler angles alongside any quaternion-shaped submessage.
+      if (isQuatLike(val)) {
+        for (const ang of ['roll', 'pitch', 'yaw']) {
+          out.push({ path: `${path}.${ang}°`, type: 'derived', plottable: true, derived: true });
+        }
+      }
+    }
+  }
+  return out;
+}
+
+// Resolve a flattened path against a message. Handles the derived euler
+// channels by recomputing them from the parent quaternion on the fly.
+function inspGetValue(msg, path) {
+  const m = path.match(/^(.*)\.(roll|pitch|yaw)°$/);
+  if (m) {
+    const q = inspGetValue(msg, m[1]);
+    if (!isQuatLike(q)) return undefined;
+    const [roll, pitch, yaw] = quatToEuler(q.x, q.y, q.z, q.w);
+    return { roll, pitch, yaw }[m[2]];
+  }
+  let cur = msg;
+  // Split "a.b[2].c" into ['a','b',2,'c'].
+  for (const tok of path.split('.')) {
+    const parts = tok.split(/[[\]]/).filter((s) => s !== '');
+    for (const p of parts) {
+      if (cur === null || cur === undefined) return undefined;
+      cur = /^\d+$/.test(p) ? cur[Number(p)] : cur[p];
+    }
+  }
+  return cur;
+}
+
+function buildFieldList(msg) {
+  const flat = flattenMessage(msg, '', [], 0);
+  flattenedHasEuler = new Set(flat.filter((f) => f.derived).map((f) => f.path));
+  const next = new Map();
+  for (const f of flat) {
+    const prev = inspFields.get(f.path);
+    next.set(f.path, Object.assign({}, f, {
+      // Preserve the user's checkbox state across reconnects/refreshes.
+      checked: prev ? prev.checked : defaultChecked(f),
+    }));
+  }
+  inspFields = next;
+  inspFieldsBuilt = true;
+  renderFieldList();
+  syncSeries();
+}
+
+// Sensible first view: plottable scalars on, header/covariance noise off.
+function defaultChecked(f) {
+  if (!f.plottable) return false;
+  if (f.derived) return true;
+  if (/^header\./.test(f.path)) return false;
+  if (/covariance/.test(f.path)) return false;
+  // A quaternion's raw components are redundant once euler is offered.
+  if (/\.(x|y|z|w)$/.test(f.path) && inspHasEulerSibling(f.path)) return false;
+  return true;
+}
+
+// Paths of the derived euler channels found in the current message type,
+// populated by buildFieldList() before any defaultChecked() call reads it.
+let flattenedHasEuler = new Set();
+
+function inspHasEulerSibling(path) {
+  return flattenedHasEuler.has(path.replace(/\.(x|y|z|w)$/, '') + '.roll°');
+}
+
+function renderFieldList() {
+  const el = $('#inspFieldList');
+  if (!inspFields.size) {
+    el.innerHTML = '<div class="empty-state">Waiting for first message…</div>';
+    return;
+  }
+  let html = '', lastGroup = null;
+  for (const f of inspFields.values()) {
+    // Group by the containing submessage, treating "foo[3]" as belonging to
+    // group "foo" so a 9-element covariance reads as 0..8 under one heading
+    // rather than nine identically-truncated rows under "(root)".
+    const arr = f.path.match(/^(.*?)\[(.+)\]$/);
+    let group, leaf;
+    if (arr) {
+      group = arr[1];
+      leaf = `[${arr[2]}]`;
+    } else if (f.path.includes('.')) {
+      group = f.path.split('.').slice(0, -1).join('.');
+      leaf = f.path.split('.').slice(-1)[0];
+    } else {
+      group = '(root)';
+      leaf = f.path;
+    }
+    if (group !== lastGroup) { html += `<div class="fl-group">${escapeHtml(group)}</div>`; lastGroup = group; }
+    html += `<label class="fl-row ${f.plottable ? 'fl-plottable' : 'nonplot'}" title="${escapeHtml(f.path)}">
+      <input type="checkbox" data-path="${escapeHtml(f.path)}" ${f.checked ? 'checked' : ''}
+             onchange="onFieldToggle(this)">
+      <span class="fl-name ${f.derived ? 'fl-derived' : ''}">${escapeHtml(leaf)}</span>
+      <span class="fl-type">${escapeHtml(f.type)}</span>
+    </label>`;
+  }
+  el.innerHTML = html;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+function onFieldToggle(cb) {
+  const f = inspFields.get(cb.dataset.path);
+  if (f) f.checked = cb.checked;
+  syncSeries();
+  renderPlot();
+}
+
+function inspSetAllFields(on) {
+  for (const f of inspFields.values()) if (f.plottable || !on) f.checked = on && f.plottable;
+  renderFieldList();
+  syncSeries();
+  renderPlot();
+}
+
+// Keep the plot's series set in step with the checked plottable fields,
+// preserving already-collected history for channels that stay selected.
+function syncSeries() {
+  const wanted = [...inspFields.values()].filter((f) => f.checked && f.plottable).map((f) => f.path);
+  for (const path of [...inspSeries.keys()]) if (!wanted.includes(path)) inspSeries.delete(path);
+  wanted.forEach((path) => {
+    if (!inspSeries.has(path)) inspSeries.set(path, { t: [], v: [] });
+  });
+  let i = 0;
+  for (const s of inspSeries.values()) s.color = PALETTE[i++ % PALETTE.length];
+  renderPlotLegend();
+}
+
+function renderPlotLegend() {
+  const el = $('#inspPlotLegend');
+  el.innerHTML = [...inspSeries.entries()]
+    .map(([path, s]) => `<span><span class="sw" style="background:${s.color}"></span>${escapeHtml(path)}</span>`)
+    .join('');
+  $('#inspPlotHint').textContent = inspSeries.size
+    ? `${inspSeries.size} channel(s) · ${plotWindowSec}s window`
+    : 'Check numeric fields on the left to plot them.';
+}
+
+// --- raw terminal ----------------------------------------------------
+
+// Render a message as a compact one-line-per-field block, honouring the
+// field checkboxes so the feed only carries what the user asked for.
+function formatRawMessage(msg) {
+  const checked = [...inspFields.values()].filter((f) => f.checked);
+  const rows = (checked.length ? checked : [...inspFields.values()]).map((f) => {
+    let v = inspGetValue(msg, f.path);
+    if (typeof v === 'number') v = Number.isInteger(v) ? String(v) : v.toFixed(6);
+    else if (typeof v === 'string') v = v.length > 96 ? `<${f.type}>` : JSON.stringify(v);
+    else if (v === undefined) v = '—';
+    else v = JSON.stringify(v);
+    return `<span class="rk">${escapeHtml(f.path)}</span>=<span class="rv">${escapeHtml(v)}</span>`;
+  });
+  return rows.join('<span class="rs">  </span>');
+}
+
+function appendRaw(msg) {
+  if (rawPaused) return;
+  const now = performance.now();
+  if (now - rawLastAppend < 1000 / RAW_THROTTLE_HZ) return;
+  rawLastAppend = now;
+  const term = $('#rawTerm');
+  const div = document.createElement('div');
+  div.className = 'rl';
+  const ts = new Date().toISOString().substr(11, 12);
+  div.innerHTML = `<span class="rt">[${ts}]</span> ${formatRawMessage(msg)}`;
+  term.appendChild(div);
+  while (term.childElementCount > RAW_MAX_LINES) term.removeChild(term.firstChild);
+  if (rawAutoscroll) term.scrollTop = term.scrollHeight;
+}
+
+function toggleRawPause() {
+  rawPaused = !rawPaused;
+  const b = $('#rawPauseBtn');
+  b.textContent = rawPaused ? 'Resume' : 'Pause';
+  b.classList.toggle('on', rawPaused);
+}
+
+function toggleRawScroll() {
+  rawAutoscroll = !rawAutoscroll;
+  $('#rawScrollBtn').classList.toggle('on', rawAutoscroll);
+}
+
+function clearRawTerm() { $('#rawTerm').innerHTML = ''; }
+
+// --- time-series plot ------------------------------------------------
+
+// Hand-rolled Canvas 2D plot with real, human-readable axis ticks and a
+// sliding time window. Deliberately separate from StripChart above, which
+// plots sample-index vs value with no axes and a fixed point budget.
+class TimePlot {
+  constructor(canvas) {
+    this.canvas = canvas;
+    this.ctx = canvas.getContext('2d');
+    this._resize();
+    window.addEventListener('resize', () => { this._resize(); this.render(); });
+  }
+  _resize() {
+    const rect = this.canvas.getBoundingClientRect();
+    this.dpr = window.devicePixelRatio || 1;
+    this.canvas.width = Math.max(1, Math.floor(rect.width * this.dpr));
+    this.canvas.height = Math.max(1, Math.floor(rect.height * this.dpr));
+  }
+  // "Nice" tick step: 1/2/5 x 10^n covering the range in ~target divisions.
+  _niceStep(range, target) {
+    if (!(range > 0)) return 1;
+    const raw = range / target;
+    const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+    const norm = raw / mag;
+    const step = norm <= 1 ? 1 : norm <= 2 ? 2 : norm <= 5 ? 5 : 10;
+    return step * mag;
+  }
+  _fmt(v, step) {
+    const dec = Math.max(0, Math.min(6, Math.ceil(-Math.log10(step)) + 1));
+    if (Math.abs(v) >= 1e5 || (v !== 0 && Math.abs(v) < 1e-4)) return v.toExponential(1);
+    return v.toFixed(dec);
+  }
+  render(series, tNow, windowSec) {
+    const { ctx } = this;
+    const W = this.canvas.width, H = this.canvas.height, d = this.dpr;
+    const padL = 58 * d, padR = 12 * d, padT = 10 * d, padB = 26 * d;
+    const pw = Math.max(1, W - padL - padR), ph = Math.max(1, H - padT - padB);
+    ctx.clearRect(0, 0, W, H);
+    ctx.font = `${10 * d}px 'SF Mono','Consolas',monospace`;
+    ctx.textBaseline = 'middle';
+
+    const t1 = tNow, t0 = tNow - windowSec;
+    let lo = Infinity, hi = -Infinity;
+    if (series) {
+      for (const s of series.values()) {
+        for (let i = 0; i < s.t.length; i++) {
+          if (s.t[i] < t0) continue;
+          const v = s.v[i];
+          if (!isFinite(v)) continue;
+          if (v < lo) lo = v;
+          if (v > hi) hi = v;
+        }
+      }
+    }
+    if (!isFinite(lo) || !isFinite(hi)) { lo = -1; hi = 1; }
+    if (hi - lo < 1e-9) { const c = (hi + lo) / 2; lo = c - 0.5; hi = c + 0.5; }
+    const padY = (hi - lo) * 0.1; lo -= padY; hi += padY;
+
+    const X = (t) => padL + ((t - t0) / (t1 - t0)) * pw;
+    const Y = (v) => padT + (1 - (v - lo) / (hi - lo)) * ph;
+
+    // Grid + ticks
+    const yStep = this._niceStep(hi - lo, 5);
+    ctx.strokeStyle = '#2d3348'; ctx.fillStyle = '#8b91a8'; ctx.lineWidth = 1 * d;
+    ctx.textAlign = 'right';
+    for (let v = Math.ceil(lo / yStep) * yStep; v <= hi; v += yStep) {
+      const y = Y(v);
+      ctx.globalAlpha = 0.5;
+      ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(padL + pw, y); ctx.stroke();
+      ctx.globalAlpha = 1;
+      ctx.fillText(this._fmt(v, yStep), padL - 6 * d, y);
+    }
+    const tStep = this._niceStep(windowSec, 6);
+    ctx.textAlign = 'center';
+    for (let k = Math.ceil(t0 / tStep) * tStep; k <= t1; k += tStep) {
+      const x = X(k);
+      ctx.globalAlpha = 0.5;
+      ctx.beginPath(); ctx.moveTo(x, padT); ctx.lineTo(x, padT + ph); ctx.stroke();
+      ctx.globalAlpha = 1;
+      // Label relative to now: 0 at the right edge, negative into the past.
+      ctx.fillText(`${(k - t1).toFixed(tStep < 1 ? 1 : 0)}s`, x, padT + ph + 13 * d);
+    }
+    // Axis frame
+    ctx.globalAlpha = 1; ctx.strokeStyle = '#2d3348';
+    ctx.strokeRect(padL, padT, pw, ph);
+
+    if (!series || !series.size) {
+      ctx.fillStyle = '#8b91a8'; ctx.textAlign = 'center';
+      ctx.fillText('No channels selected', padL + pw / 2, padT + ph / 2);
+      return;
+    }
+    // Series
+    ctx.save();
+    ctx.beginPath(); ctx.rect(padL, padT, pw, ph); ctx.clip();
+    for (const s of series.values()) {
+      ctx.strokeStyle = s.color; ctx.lineWidth = 1.5 * d;
+      ctx.beginPath();
+      let started = false;
+      for (let i = 0; i < s.t.length; i++) {
+        if (s.t[i] < t0) continue;
+        const v = s.v[i];
+        if (!isFinite(v)) { started = false; continue; }
+        const x = X(s.t[i]), y = Y(v);
+        if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+}
+
+function renderPlot() {
+  if (!inspPlot) return;
+  const tNow = inspT0 === null ? 0 : (performance.now() - inspT0) / 1000;
+  inspPlot.render(inspSeries, tNow, plotWindowSec);
+}
+
+function onPlotWindowChange() {
+  const v = parseFloat($('#plotWindow').value);
+  if (isFinite(v) && v > 0) plotWindowSec = v;
+  renderPlotLegend();
+  renderPlot();
+}
+
+function togglePlotPause() {
+  plotPaused = !plotPaused;
+  const b = $('#plotPauseBtn');
+  b.textContent = plotPaused ? 'Resume' : 'Pause';
+  b.classList.toggle('on', plotPaused);
+}
+
+// --- subscription + wiring -------------------------------------------
+
+function onInspectorMessage(msg) {
+  const nowMs = performance.now();
+  if (inspT0 === null) inspT0 = nowMs;
+  const t = (nowMs - inspT0) / 1000;
+
+  inspMsgCount++;
+  inspLastMsg = msg;
+
+  // Rate over a 3s trailing window - steadier than an inter-arrival estimate.
+  inspRateStamps.push(nowMs);
+  while (inspRateStamps.length && nowMs - inspRateStamps[0] > 3000) inspRateStamps.shift();
+
+  if (!inspFieldsBuilt) buildFieldList(msg);
+
+  if (!plotPaused) {
+    const cutoff = t - Math.max(plotWindowSec, 1) * 1.5;
+    for (const [path, s] of inspSeries) {
+      let v = inspGetValue(msg, path);
+      if (typeof v === 'boolean') v = v ? 1 : 0;
+      if (typeof v !== 'number' || !isFinite(v)) continue;
+      s.t.push(t); s.v.push(v);
+      // Trim to the retained window (plus slack) and the hard point cap.
+      let drop = 0;
+      while (drop < s.t.length && s.t[drop] < cutoff) drop++;
+      if (s.t.length - drop > PLOT_MAX_POINTS) drop = s.t.length - PLOT_MAX_POINTS;
+      if (drop > 0) { s.t.splice(0, drop); s.v.splice(0, drop); }
+    }
+  }
+  appendRaw(msg);
+}
+
+function inspUnsubscribe() {
+  if (inspSub) { ros.unsubscribe(inspSub.topic, inspSub.cb); inspSub = null; }
+}
+
+function onInspectorTopicChange() {
+  inspUnsubscribe();
+  const sel = $('#inspTopicSelect');
+  const topic = sel.value;
+  const entry = liveTopics.find((t) => t.name === topic);
+
+  inspTopic = topic || null;
+  inspType = entry ? entry.type : null;
+  inspFields = new Map();
+  inspFieldsBuilt = false;
+  inspSeries = new Map();
+  inspMsgCount = 0;
+  inspRateStamps = [];
+  inspT0 = null;
+  inspLastMsg = null;
+  clearRawTerm();
+  renderFieldList();
+  renderPlotLegend();
+  renderPlot();
+
+  $('#inspName').textContent = inspTopic || '–';
+  $('#inspType').textContent = inspType || '–';
+  $('#inspCount').textContent = '0';
+  $('#inspRate').textContent = '–';
+  if (!inspTopic || !inspType) return;
+
+  const cb = (msg) => onInspectorMessage(msg);
+  ros.subscribe(inspTopic, inspType, cb);
+  inspSub = { topic: inspTopic, cb };
+}
+
+function populateInspectorTopics() {
+  const sel = $('#inspTopicSelect');
+  const showAll = $('#inspAllVessels').checked;
+  const items = liveTopics
+    .filter((t) => showAll || !INSP_HIDDEN_TOPICS.test(t.name))
+    .slice()
+    .sort((a, b) => a.name.localeCompare(b.name));
+  const prev = inspTopic;
+  sel.innerHTML = items.length
+    ? items.map((t) => `<option value="${escapeHtml(t.name)}">${escapeHtml(t.name)}  —  ${escapeHtml(t.type || '?')}</option>`).join('')
+    : '<option value="">No topics discovered yet</option>';
+  // Keep the current selection across periodic refreshes; only (re)subscribe
+  // when the selection actually changes, so the plot history survives.
+  if (prev && items.some((t) => t.name === prev)) { sel.value = prev; return; }
+  if (items.length) { sel.value = items[0].name; onInspectorTopicChange(); }
+}
+
+function refreshInspectorTopics() { fetchLiveTopics(() => populateInspectorTopics()); }
+
+function initInspector() {
+  inspPlot = new TimePlot($('#inspPlot'));
+  $('#rawThrottleLabel').textContent = String(RAW_THROTTLE_HZ);
+  // Single animation-rate redraw loop: message arrival only appends data,
+  // so a 100 Hz topic still costs exactly one repaint per frame.
+  const tick = () => {
+    if ($('#view-inspector').classList.contains('active')) {
+      if (inspTopic) {
+        const hz = inspRateStamps.length > 1
+          ? (inspRateStamps.length - 1) / ((inspRateStamps[inspRateStamps.length - 1] - inspRateStamps[0]) / 1000)
+          : 0;
+        const stale = inspRateStamps.length && performance.now() - inspRateStamps[inspRateStamps.length - 1] > 3000;
+        $('#inspRate').textContent = (!inspRateStamps.length || stale) ? '0.0 Hz' : hz.toFixed(1) + ' Hz';
+        $('#inspCount').textContent = String(inspMsgCount);
+      }
+      renderPlot();
+    }
+    requestAnimationFrame(tick);
+  };
+  requestAnimationFrame(tick);
+}
+
+// ---------------------------------------------------------------------
 // Page wiring
 // ---------------------------------------------------------------------
 function setView(name) {
   document.querySelectorAll('.tab').forEach((t) => t.classList.toggle('active', t.dataset.view === name));
   document.querySelectorAll('.view').forEach((v) => v.classList.toggle('active', v.id === 'view-' + name));
   if (name === 'pointcloud' && pcViewer) pcViewer.resize();
+  if (name === 'inspector' && inspPlot) { inspPlot._resize(); renderPlot(); }
 }
 
 function populateSelect(sel, items, labelFn) {
@@ -774,11 +1392,18 @@ async function loadSensorConfig() {
 }
 
 initRos();
+initInspector();
 loadSensorConfig();
 setInterval(loadSensorConfig, 5000);
 // Refresh discovered topics periodically too (new vessels/sensors can finish
 // their handshake and start publishing after the page has already loaded).
-setInterval(() => fetchLiveTopics(() => { if (currentVessel) onVesselChange(); }), 5000);
+// The inspector's topic dropdown is refreshed from the same sweep, but it
+// keeps its own subscription (not in activeSubs) so that the vessel-change
+// clearSubs() above can't silently drop the topic being inspected.
+setInterval(() => fetchLiveTopics(() => {
+  if (currentVessel) onVesselChange();
+  populateInspectorTopics();
+}), 5000);
 </script>
 </body>
 </html>
