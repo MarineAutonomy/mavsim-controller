@@ -133,25 +133,27 @@ class BridgeState:
         rate = config.get("rate", 10.0)
         token_path = config.get("token_path", "")
 
+        # "--opt=value" throughout: these carry user-supplied values, and a
+        # value that is empty or happens to start with "-" is read by argparse
+        # as the next flag rather than as the value (see _launch_observer in
+        # core/base_controller.py, where exactly that killed the observer).
         cmd = [sys.executable, "-u", "run_controller.py"]
         if token_path:
-            cmd += ["--token", token_path]
+            cmd += [f"--token={token_path}"]
         else:
             cmd += [
-                "--code",
-                config.get("code", ""),
-                "--backend-url",
-                config.get("backend_url", "http://localhost:5000"),
+                f"--code={config.get('code', '')}",
+                f"--backend-url={config.get('backend_url', 'http://localhost:5000')}",
             ]
             vessel_name = config.get("vessel_name", "")
             if vessel_name:
-                cmd += ["--vessel-name", vessel_name]
+                cmd += [f"--vessel-name={vessel_name}"]
 
         cmd += ["--rate", str(rate)]
         # Sensors are always enabled (plans/plan_headless_observer.md) - no more
         # opt-in --enable-sensors flag. The headless observer needs a real,
         # reachable frontend URL to trigger camera/lidar streaming.
-        cmd += ["--frontend-url", config.get("frontend_url", "http://localhost:5173")]
+        cmd += [f"--frontend-url={config.get('frontend_url', 'http://localhost:5173')}"]
         return cmd
 
     def _read_output(self):

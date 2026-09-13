@@ -1318,12 +1318,19 @@ class BaseController:
         """
         try:
             observer_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "observer.py")
+            # "--opt=value", not "--opt", "value": session API tokens are
+            # URL-safe base64 and so can legitimately begin with "-", which
+            # argparse otherwise reads as the start of another flag and
+            # rejects with "expected one argument", killing the observer at
+            # startup. That made camera/lidar streaming fail for roughly one
+            # session in thirty, purely on how the token happened to be
+            # generated. The "=" form has no such ambiguity.
             self._observer_process = subprocess.Popen([
                 sys.executable, observer_script,
-                "--session-id", session_id,
-                "--api-token", api_token,
-                "--namespace", namespace or "",
-                "--frontend-url", self.frontend_url,
+                f"--session-id={session_id}",
+                f"--api-token={api_token}",
+                f"--namespace={namespace or ''}",
+                f"--frontend-url={self.frontend_url}",
             ], start_new_session=True)
             logger.info(f"Launched headless sensor observer (pid={self._observer_process.pid})")
         except Exception as e:
