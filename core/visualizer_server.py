@@ -1386,7 +1386,20 @@ async function loadSensorConfig() {
     const vessels = Object.keys(sensorConfig);
     const sel = $('#vesselSelect');
     if (!vessels.length) { sel.innerHTML = '<option value="">No vessel yet</option>'; return; }
-    sel.innerHTML = vessels.map((v) => `<option value="${v}">${v}</option>`).join('');
+    // This runs on a 5s timer, so the option list must only be rebuilt when
+    // the vessel set actually changed: assigning innerHTML discards the
+    // <select>'s selection state, snapping it back to the first option. The
+    // periodic topic refresh then reads that reset value back through
+    // onVesselChange(), so an unconditional rebuild silently threw away the
+    // user's choice (and their inspector/chart subscriptions with it) every
+    // five seconds.
+    const existing = [...sel.options].map((o) => o.value);
+    if (existing.length !== vessels.length || existing.some((v, i) => v !== vessels[i])) {
+      sel.innerHTML = vessels.map((v) => `<option value="${v}">${v}</option>`).join('');
+      // Restore the prior pick if it survived the change; the <select> is
+      // otherwise sitting on its first option after the rebuild.
+      if (currentVessel && vessels.includes(currentVessel)) sel.value = currentVessel;
+    }
     if (!currentVessel || !vessels.includes(currentVessel)) { currentVessel = vessels[0]; sel.value = currentVessel; onVesselChange(); }
   } catch (e) { console.error('Failed to load sensor config', e); }
 }
