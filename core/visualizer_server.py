@@ -863,8 +863,9 @@ function onLidarChange() {
 // pose (sensor_location/sensor_orientation, both relative to the vessel
 // body frame) is applied the same way Three.js applies object
 // position/rotation elsewhere in this codebase (XYZ Euler order, degrees).
-// If the overlay looks rotated/mirrored relative to the real camera view,
-// this Euler-order assumption is the first thing to revisit.
+// See projectLidarToCamera() for the lidar-frame axis convention, which is
+// NOT the same handedness as the frame those mounting poses are expressed
+// in and has to be converted before the poses are composed.
 // ---------------------------------------------------------------------
 let ovCamSub = null, ovLidarSub = null, ovLatestCloud = null, ovLatestCamMsg = null;
 function onOverlayChange() {
@@ -924,6 +925,20 @@ function makePoseObject(sensor) {
   return obj;
 }
 
+// PointCloud2 points arrive in the lidar's OWN local frame, which
+// LidarSensor.js defines as X=forward, Y=left, Z=up (its ray directions are
+// built as [cos(el)cos(az), cos(el)sin(az), sin(el)], so azimuth sweeps X-Y
+// and elevation is Z).
+//
+// The mounting poses live in a parent frame with the opposite handedness on
+// two axes: the camera's [-90, 0, 90] mounting puts its forward on +X but
+// its up on -Z and its right on +Y, i.e. Y=right and Z=down. Converting a
+// lidar point into that parent frame is therefore a 180-degree roll about X,
+// (x, y, z) -> (x, -y, -z). Without it the overlay is mirrored on both axes:
+// targets to the left project to the right of the image and targets above
+// project below, which is the bulk of any visible misalignment.
+const LIDAR_TO_BODY_ROLL = new THREE.Matrix4().makeRotationX(Math.PI);
+
 function projectLidarToCamera(camSensor, lidarSensor, cloud, imgW, imgH) {
   const lidarObj = makePoseObject(lidarSensor);
   const projCam = new THREE.PerspectiveCamera(camSensor.fov || 60, imgW / imgH, 0.05, 1000);
@@ -938,7 +953,11 @@ function projectLidarToCamera(camSensor, lidarSensor, cloud, imgW, imgH) {
   const n = cloud.count;
   for (let i = 0; i < n; i++) {
     v.set(cloud.positions[i * 3], cloud.positions[i * 3 + 1], cloud.positions[i * 3 + 2]);
-    lidarObj.localToWorld(v);
+    // Axis convention first, then the mounting pose ONCE. localToWorld() was
+    // previously applied to points that were already in the lidar's frame,
+    // which added the lidar's own location/rotation a second time.
+    v.applyMatrix4(LIDAR_TO_BODY_ROLL);
+    v.applyMatrix4(lidarObj.matrixWorld);
     local.copy(v);
     projCam.worldToLocal(local);
     if (local.z >= 0) continue; // behind the camera (Three.js looks down -Z)
