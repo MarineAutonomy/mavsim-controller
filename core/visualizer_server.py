@@ -751,9 +751,12 @@ class PointCloudViewer {
     window.addEventListener('mousemove', (e) => {
       if (!dragging) return;
       const dx = e.clientX - lastX, dy = e.clientY - lastY; lastX = e.clientX; lastY = e.clientY;
-      this.theta -= dx * 0.01;
-      // "+dy" because phi is measured from -Z now (see _updateCamera): with
-      // the vertical sense flipped, dragging up must still tilt the eye up.
+      // Both signs are "+" because this is a Z-DOWN frame with up = -Z, which
+      // reverses screen-right relative to the usual Z-up orbit. Grab-the-scene
+      // feel: drag right and the scene follows the cursor (the eye swings
+      // left around the target); drag down and the eye drops toward the
+      // horizon. phi is measured from -Z, so larger phi = lower eye.
+      this.theta += dx * 0.01;
       this.phi = Math.max(0.05, Math.min(Math.PI - 0.05, this.phi + dy * 0.01));
       this._updateCamera();
     });

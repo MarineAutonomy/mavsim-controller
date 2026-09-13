@@ -201,3 +201,54 @@ class TestOverlayRegressions(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+@unittest.skipIf(np is None, "numpy not available")
+class TestPointCloudOrbit(unittest.TestCase):
+    """Orbit controls for the Z-down point cloud viewer.
+
+    The viewer renders the lidar frame directly (X=forward, Y=left, Z=down)
+    with up = -Z. Flipping the up-vector also reverses screen-right, so BOTH
+    drag axes need the opposite sign to the usual Z-up orbit - fixing only
+    the vertical one leaves the horizontal drag inverted.
+    """
+
+    UP = np.array([0.0, 0.0, -1.0])
+
+    def _eye(self, theta, phi, radius=6.0):
+        """Mirrors _updateCamera(): phi measured from -Z."""
+        return np.array([radius * math.sin(phi) * math.cos(theta),
+                         radius * math.sin(phi) * math.sin(theta),
+                         -radius * math.cos(phi)])
+
+    def _screen_right(self, eye):
+        fwd = -eye / np.linalg.norm(eye)          # looking at the origin
+        right = np.cross(fwd, self.UP)
+        return right / np.linalg.norm(right)
+
+    def test_default_view_is_above_the_scene(self):
+        """phi < pi/2 must put the eye above, i.e. at negative z."""
+        eye = self._eye(math.pi / 4, math.pi / 3)
+        self.assertLess(eye[2], 0, "default eye is below the scene")
+
+    def test_drag_right_swings_camera_left(self):
+        """Grab-the-scene: drag right, the scene follows, the eye goes left."""
+        theta, phi = math.pi / 4, math.pi / 3
+        e0 = self._eye(theta, phi)
+        e1 = self._eye(theta + 0.2, phi)          # theta += dx
+        self.assertLess(float((e1 - e0) @ self._screen_right(e0)), 0,
+                        "drag right should move the eye left around the target")
+
+    def test_drag_down_lowers_the_eye(self):
+        theta, phi = math.pi / 4, math.pi / 3
+        e0 = self._eye(theta, phi)
+        e1 = self._eye(theta, phi + 0.2)          # phi += dy
+        self.assertLess(-e1[2], -e0[2], "drag down should lower the eye")
+
+    def test_inverted_horizontal_sign_is_wrong(self):
+        """The bug this guards: theta -= dx feels backwards in a Z-down frame."""
+        theta, phi = math.pi / 4, math.pi / 3
+        e0 = self._eye(theta, phi)
+        e1 = self._eye(theta - 0.2, phi)
+        self.assertGreater(float((e1 - e0) @ self._screen_right(e0)), 0,
+                           "theta -= dx moves the eye right; that is the inverted feel")
