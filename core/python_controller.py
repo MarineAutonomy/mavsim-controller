@@ -281,6 +281,15 @@ class MavsimAPIClient:
         
         self._control_url = f"{self.backend_url}/api/control"
         self._handshake_url = f"{self.backend_url}/api/control/handshake"
+
+        # Set once the backend reports this session is no longer running (it
+        # answers /api/control with 404 "Session not running" once the sim has
+        # ended, e.g. on reaching its maximum simulation time). Latched rather
+        # than recomputed per request: the session cannot go back to running,
+        # and a later transport error must not clear it.
+        self.session_ended = False
+        self.session_end_reason: Optional[str] = None
+
         logger.info(f"API client initialized: {self._control_url}")
     
     @classmethod
@@ -408,13 +417,30 @@ class MavsimAPIClient:
             if response.status_code == 200:
                 return True
             else:
-                error_data = response.json()
+                try:
+                    error_data = response.json()
+                except ValueError:
+                    error_data = {}
+                error = error_data.get('error', 'Unknown error')
+
+                # The backend answers 404 "Session not running" once the
+                # simulation has ended (maximum simulation time reached, or
+                # stopped from the UI). That is a terminal condition, not a
+                # transient failure: every subsequent command gets the same
+                # answer, so latch it and let the caller shut down instead of
+                # retrying at the control rate forever.
+                if response.status_code == 404 and 'not running' in str(error).lower():
+                    if not self.session_ended:
+                        self.session_ended = True
+                        self.session_end_reason = error_data.get('message') or error
+                        logger.info(f"Simulation session has ended: {self.session_end_reason}")
+                    return False
+
                 logger.warning(
-                    f"Control command failed: {response.status_code} - "
-                    f"{error_data.get('error', 'Unknown error')}"
+                    f"Control command failed: {response.status_code} - {error}"
                 )
                 return False
-                
+
         except requests.exceptions.Timeout:
             logger.error("Control command timed out")
             return False

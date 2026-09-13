@@ -1026,18 +1026,67 @@ class BaseController:
                     vessel_states = self._controller.get_vessel_states() or {}
 
                 if not vessel_states:
+                    # Still check for a finished session here: state can dry
+                    # up at exactly the moment the simulation ends, and this
+                    # branch would otherwise skip the check below forever.
+                    if self._session_ended():
+                        self._handle_session_ended()
+                        return
                     time.sleep(period)
                     continue
                 
                 result = self.control_loop(vessel_states)
-                
+
                 if result:
                     self._dispatch_commands(result)
-                
+
+                # The backend reports a finished simulation by refusing
+                # further commands (404 "Session not running"). Without this
+                # the loop keeps posting at the control rate against a dead
+                # session indefinitely, filling the log with failures.
+                if self._session_ended():
+                    self._handle_session_ended()
+                    return
+
             except Exception as e:
                 logger.error(f"Control loop error: {e}", exc_info=True)
-            
+
             time.sleep(period)
+
+    def _all_clients(self):
+        """Every API client this controller drives, primary and per-vessel."""
+        clients = list(self._controllers.values())
+        if self._controller is not None and self._controller not in clients:
+            clients.append(self._controller)
+        return clients
+
+    def _session_ended(self) -> bool:
+        """True once the backend has told us the simulation is over.
+
+        All vessels in a session share its lifecycle, so one client seeing
+        the session end is enough - and in multi-vessel mode only the vessels
+        actually commanded this tick would have observed it.
+        """
+        return any(getattr(c, 'session_ended', False) for c in self._all_clients())
+
+    def _handle_session_ended(self):
+        """Stop cleanly after the simulation has finished.
+
+        Shutting the controller down is the point of detecting this, but the
+        teardown itself is left to the normal close() path (run() returns once
+        _running goes False) so that recordings are finalized and subprocesses
+        are torn down exactly as they are for a signal-driven shutdown.
+        """
+        reason = next(
+            (getattr(c, 'session_end_reason', None) for c in self._all_clients()
+             if getattr(c, 'session_ended', False) and getattr(c, 'session_end_reason', None)),
+            None,
+        )
+        logger.info(
+            "Simulation finished - stopping controller"
+            + (f": {reason}" if reason else "")
+        )
+        self._running = False
 
     def _dispatch_commands(self, result: dict):
         """Dispatch control_loop return value to the appropriate vessel controllers."""
