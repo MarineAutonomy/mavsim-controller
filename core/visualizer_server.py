@@ -751,13 +751,14 @@ class PointCloudViewer {
     window.addEventListener('mousemove', (e) => {
       if (!dragging) return;
       const dx = e.clientX - lastX, dy = e.clientY - lastY; lastX = e.clientX; lastY = e.clientY;
-      // Both signs are "+" because this is a Z-DOWN frame with up = -Z, which
-      // reverses screen-right relative to the usual Z-up orbit. Grab-the-scene
-      // feel: drag right and the scene follows the cursor (the eye swings
-      // left around the target); drag down and the eye drops toward the
-      // horizon. phi is measured from -Z, so larger phi = lower eye.
+      // Grab-the-scene feel on both axes: the scene follows the cursor.
+      // Drag right -> the eye swings left around the target. Drag down ->
+      // the eye RISES, which is what makes the scene appear to move down;
+      // lowering the eye on a downward drag looks backwards even though it
+      // sounds right. (Z-down frame with up = -Z, so screen-right is
+      // reversed relative to a Z-up orbit and phi is measured from -Z.)
       this.theta += dx * 0.01;
-      this.phi = Math.max(0.05, Math.min(Math.PI - 0.05, this.phi + dy * 0.01));
+      this.phi = Math.max(0.05, Math.min(Math.PI - 0.05, this.phi - dy * 0.01));
       this._updateCamera();
     });
     dom.addEventListener('wheel', (e) => {

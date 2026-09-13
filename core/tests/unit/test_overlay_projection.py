@@ -226,6 +226,14 @@ class TestPointCloudOrbit(unittest.TestCase):
         right = np.cross(fwd, self.UP)
         return right / np.linalg.norm(right)
 
+    def _screen_y(self, eye, feature):
+        """Where a world point sits vertically on screen, as a depth-normalised
+        offset: larger means higher up the image."""
+        fwd = -eye / np.linalg.norm(eye)
+        up = np.cross(self._screen_right(eye), fwd)
+        d = feature - eye
+        return float(d @ up) / float(d @ fwd)
+
     def test_default_view_is_above_the_scene(self):
         """phi < pi/2 must put the eye above, i.e. at negative z."""
         eye = self._eye(math.pi / 4, math.pi / 3)
@@ -239,11 +247,30 @@ class TestPointCloudOrbit(unittest.TestCase):
         self.assertLess(float((e1 - e0) @ self._screen_right(e0)), 0,
                         "drag right should move the eye left around the target")
 
-    def test_drag_down_lowers_the_eye(self):
+    def test_drag_down_moves_the_scene_down(self):
+        """The test that matters is perceived motion, not eye height.
+
+        Grab-the-scene means the scene follows the cursor, so a downward
+        drag must push the view's content DOWN the image. That happens when
+        the eye RISES (phi -= dy), which is the opposite of what "drag down
+        = lower the camera" would suggest - the reason this was first
+        implemented backwards.
+        """
         theta, phi = math.pi / 4, math.pi / 3
+        feature = np.array([5.0, 0.0, 0.0])       # a point on the ground ahead
         e0 = self._eye(theta, phi)
-        e1 = self._eye(theta, phi + 0.2)          # phi += dy
-        self.assertLess(-e1[2], -e0[2], "drag down should lower the eye")
+        e1 = self._eye(theta, phi - 0.25)         # phi -= dy
+        self.assertLess(self._screen_y(e1, feature), self._screen_y(e0, feature),
+                        "drag down should move the scene down the image")
+
+    def test_inverted_vertical_sign_is_wrong(self):
+        """phi += dy lowers the eye but sends the scene the wrong way."""
+        theta, phi = math.pi / 4, math.pi / 3
+        feature = np.array([5.0, 0.0, 0.0])
+        e0 = self._eye(theta, phi)
+        e1 = self._eye(theta, phi + 0.25)
+        self.assertGreater(self._screen_y(e1, feature), self._screen_y(e0, feature),
+                           "phi += dy moves the scene up; that is the inverted feel")
 
     def test_inverted_horizontal_sign_is_wrong(self):
         """The bug this guards: theta -= dx feels backwards in a Z-down frame."""
