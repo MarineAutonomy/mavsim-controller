@@ -107,7 +107,6 @@ _PAGE_HTML = """<!DOCTYPE html>
   .legend{font-size:.72rem;color:var(--text2);display:flex;gap:10px;flex-wrap:wrap;margin-top:6px;}
   .legend span{display:inline-flex;align-items:center;gap:4px;}
   .legend .sw{width:10px;height:10px;border-radius:2px;display:inline-block;}
-  canvas.strip{width:100%;height:140px;display:block;background:var(--bg);border-radius:4px;}
   .toolbar{display:flex;align-items:center;gap:12px;margin-bottom:12px;flex-wrap:wrap;}
   .empty-state{color:var(--text2);font-size:.85rem;text-align:center;padding:30px;}
   .cam-view{background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);
@@ -160,6 +159,23 @@ _PAGE_HTML = """<!DOCTYPE html>
   .num-in{width:64px;padding:4px 7px;border:1px solid var(--border);border-radius:5px;
     background:var(--bg);color:var(--text);font-size:.8rem;outline:none;font-family:var(--mono);}
   .insp-hint{font-size:.72rem;color:var(--text2);margin-top:8px;}
+
+  /* ---- Time Histories: one block of 4 odometry plots per vessel ---- */
+  .vessel-block{margin-bottom:26px;}
+  .vessel-block > h2{font-size:.95rem;font-weight:600;margin-bottom:12px;display:flex;
+    align-items:center;gap:10px;}
+  .vessel-block > h2 .vname{font-family:var(--mono);color:var(--accent);}
+  .vessel-block > h2 .vrate{font-size:.72rem;color:var(--text2);font-weight:400;}
+  /* Fixed 2x2 so each vessel reads as one block of four related plots;
+     auto-fit would reflow to 3+1 on a wide screen and break that pairing. */
+  .odo-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;}
+  @media (max-width:900px){.odo-grid{grid-template-columns:1fr;}}
+  canvas.odo{width:100%;height:210px;display:block;background:var(--bg);
+    border:1px solid var(--border);border-radius:var(--radius);}
+  /* The panel h3 is uppercased and letter-spaced, which mangles unit
+     symbols ("°" and "m/s"); opt this span out of both. */
+  .odo-unit{font-weight:400;color:var(--text2);text-transform:none;
+    letter-spacing:0;font-family:var(--mono);font-size:.78rem;margin-left:6px;}
 </style>
 </head>
 <body>
@@ -179,7 +195,15 @@ _PAGE_HTML = """<!DOCTYPE html>
 </div>
 <main>
   <div class="view active" id="view-history">
-    <div class="grid" id="historyGrid"><div class="empty-state">Waiting for sensor config&hellip;</div></div>
+    <div class="toolbar">
+      <span class="cam-stat">Odometry for all accessible vessels &middot; frames NED / BODY</span>
+      <label class="inline" style="margin-left:auto;">Window
+        <input type="number" class="num-in" id="histWindow" value="20" min="1" max="600" step="1"
+               onchange="onHistWindowChange()"> s
+      </label>
+      <button class="mini-btn" id="histPauseBtn" onclick="toggleHistPause()">Pause</button>
+    </div>
+    <div id="historyGrid"><div class="empty-state">Waiting for odometry&hellip;</div></div>
   </div>
   <div class="view" id="view-inspector">
     <div class="toolbar">
@@ -354,7 +378,7 @@ function initRos() {
     const el = $('#rosStatus');
     el.textContent = connected ? 'rosbridge: connected' : 'rosbridge: reconnecting…';
     el.className = 'status-badge ' + (connected ? 'connected' : 'disconnected');
-    if (connected) fetchLiveTopics(() => { onVesselChange(); populateInspectorTopics(); });
+    if (connected) fetchLiveTopics(refreshAllViews);
   });
 }
 
@@ -417,70 +441,15 @@ function mergedSensorsForVessel(vessel, sensorTypeLower, namePattern, typeSuffix
   return out;
 }
 
-// ---------------------------------------------------------------------
-// Time-history strip chart (hand-rolled Canvas 2D, no chart library).
-// ---------------------------------------------------------------------
-class StripChart {
-  constructor(canvas, series, maxPoints) {
-    this.canvas = canvas; this.ctx = canvas.getContext('2d');
-    this.series = series; this.maxPoints = maxPoints || 240;
-    this.data = series.map(() => []);
-    this._resize();
-    window.addEventListener('resize', () => this._resize());
-  }
-  _resize() {
-    const rect = this.canvas.getBoundingClientRect();
-    this.canvas.width = Math.max(1, Math.floor(rect.width * (window.devicePixelRatio || 1)));
-    this.canvas.height = Math.max(1, Math.floor(rect.height * (window.devicePixelRatio || 1)));
-  }
-  push(values) {
-    for (let i = 0; i < this.series.length; i++) {
-      const arr = this.data[i];
-      arr.push(values[i] == null ? 0 : values[i]);
-      if (arr.length > this.maxPoints) arr.shift();
-    }
-    this.render();
-  }
-  render() {
-    const { ctx, canvas } = this; const w = canvas.width, h = canvas.height;
-    ctx.clearRect(0, 0, w, h);
-    let lo = Infinity, hi = -Infinity;
-    for (const arr of this.data) for (const v of arr) { if (v < lo) lo = v; if (v > hi) hi = v; }
-    if (!isFinite(lo)) { lo = -1; hi = 1; }
-    if (hi - lo < 1e-6) { hi += 0.5; lo -= 0.5; }
-    const pad = (hi - lo) * 0.12; lo -= pad; hi += pad;
-    ctx.strokeStyle = '#2d3348'; ctx.lineWidth = 1;
-    ctx.beginPath(); ctx.moveTo(0, h / 2); ctx.lineTo(w, h / 2); ctx.stroke();
-    this.series.forEach((s, idx) => {
-      const arr = this.data[idx];
-      if (arr.length < 2) return;
-      ctx.strokeStyle = s.color; ctx.lineWidth = 1.5 * (window.devicePixelRatio || 1);
-      ctx.beginPath();
-      for (let i = 0; i < arr.length; i++) {
-        const x = (i / (this.maxPoints - 1)) * w;
-        const y = h - ((arr[i] - lo) / (hi - lo)) * h;
-        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-      }
-      ctx.stroke();
-    });
-  }
-}
-
 const PALETTE = ['#4f8ff7', '#f5a623', '#30a46c', '#e5484d', '#a970ff', '#26c6da', '#ff7043', '#c0ca33'];
-const activeSubs = []; // {topic, cb} pairs to clean up on vessel change
+// Time Histories' odometry subscriptions. The camera/lidar/overlay views and
+// the Topic Inspector each hold their own single subscription and unsubscribe
+// on change, so this list is only ever torn down when the set of vessels
+// changes and the history panels are rebuilt.
+const activeSubs = []; // {topic, cb}
 
 function clearSubs() { for (const { topic, cb } of activeSubs) ros.unsubscribe(topic, cb); activeSubs.length = 0; }
 function sub(topic, type, cb) { ros.subscribe(topic, type, cb); activeSubs.push({ topic, cb }); }
-
-function addChartPanel(container, title, seriesNames, topic, type, extractor) {
-  const panel = document.createElement('div'); panel.className = 'panel';
-  const series = seriesNames.map((n, i) => ({ name: n, color: PALETTE[i % PALETTE.length] }));
-  panel.innerHTML = `<h3>${title}</h3><canvas class="strip"></canvas>
-    <div class="legend">${series.map((s) => `<span><span class="sw" style="background:${s.color}"></span>${s.name}</span>`).join('')}</div>`;
-  container.appendChild(panel);
-  const chart = new StripChart(panel.querySelector('canvas'), series);
-  sub(topic, type, (msg) => chart.push(extractor(msg)));
-}
 
 function quatToEuler(x, y, z, w) {
   const sinr_cosp = 2 * (w * x + y * z), cosr_cosp = 1 - 2 * (x * x + y * y);
@@ -492,48 +461,192 @@ function quatToEuler(x, y, z, w) {
   return [roll, pitch, yaw].map((r) => r * 180 / Math.PI);
 }
 
-// Vessel body-state array layout (matches _KINEMATIC_LEN / attitude handling
-// used elsewhere in this codebase, e.g. user_repo_new/bridge_controller.py):
-// [u,v,w,p,q,r,x,y,z,<attitude 3 or 4 vals>,<actuators...>]
-const STATE_LABELS = ['u', 'v', 'w', 'p', 'q', 'r', 'x', 'y', 'z'];
+
+// ---------------------------------------------------------------------
+// Time Histories: odometry for EVERY accessible vessel, four plots each.
+//
+// Deliberately not scoped to the vessel dropdown - comparing vessels is the
+// main reason to look at this page, and /<vessel>/odometry_sim is published
+// for every vessel the session exposes (owned or observed), so there is no
+// reason to show only one. The dropdown still drives the camera/lidar tabs,
+// which are inherently single-vessel.
+//
+// Plots use TimePlot (defined with the Topic Inspector below), which plots
+// against a real time axis with labelled ticks. It replaced an earlier
+// strip-chart that drew a bare centreline and plotted against sample index,
+// so a reader could not tell what any value or time actually was.
+// ---------------------------------------------------------------------
+
+const HIST_MAX_POINTS = 20000;
+
+// The four groupings, straight off nav_msgs/Odometry. Angles are converted
+// to degrees; everything else is passed through in SI units.
+const ODO_PLOTS = [
+  {
+    key: 'position', title: 'Position (NED)', unit: 'm',
+    series: ['x', 'y', 'z'],
+    extract: (m) => [m.pose.pose.position.x, m.pose.pose.position.y, m.pose.pose.position.z],
+  },
+  {
+    key: 'orientation', title: 'Orientation', unit: '°',
+    series: ['roll', 'pitch', 'yaw'],
+    extract: (m) => {
+      const q = m.pose.pose.orientation;
+      return quatToEuler(q.x, q.y, q.z, q.w);
+    },
+  },
+  {
+    key: 'linvel', title: 'Linear Velocity (BODY)', unit: 'm/s',
+    series: ['u', 'v', 'w'],
+    extract: (m) => [m.twist.twist.linear.x, m.twist.twist.linear.y, m.twist.twist.linear.z],
+  },
+  {
+    key: 'angvel', title: 'Angular Velocity (BODY)', unit: '°/s',
+    series: ['p', 'q', 'r'],
+    extract: (m) => [
+      m.twist.twist.angular.x * 180 / Math.PI,
+      m.twist.twist.angular.y * 180 / Math.PI,
+      m.twist.twist.angular.z * 180 / Math.PI,
+    ],
+  },
+];
+
+let histWindowSec = 20;
+let histPaused = false;
+let histT0 = null;            // shared clock origin, so vessels stay aligned
+let histVessels = new Map();  // vessel -> {plots:[{plot,series}], rateStamps:[]}
+
+// Every vessel publishing odometry, from the live ROS graph rather than from
+// sensor_config.json - a vessel with no configured sensors still has
+// odometry, and would otherwise be missing from this page entirely.
+function odometryVessels() {
+  const out = [];
+  for (const t of liveTopics) {
+    const m = t.name.match(/^\/([^/]+)\/odometry_sim$/);
+    if (m && t.type && t.type.endsWith('Odometry')) out.push(m[1]);
+  }
+  return [...new Set(out)].sort();
+}
 
 function buildHistoryPanels() {
-  const grid = $('#historyGrid'); grid.innerHTML = '';
-  if (!currentVessel) { grid.innerHTML = '<div class="empty-state">No vessel selected.</div>'; return; }
-  const vesselTopic = `/${currentVessel}`;
-  addChartPanel(grid, 'Vessel State (first 9 channels)', STATE_LABELS, `${vesselTopic}/vessel_state`,
-    'std_msgs/Float64MultiArray', (msg) => STATE_LABELS.map((_, i) => msg.data[i]));
-  addChartPanel(grid, 'Vessel State Derivative (first 9 channels)', STATE_LABELS, `${vesselTopic}/vessel_state_der`,
-    'std_msgs/Float64MultiArray', (msg) => STATE_LABELS.map((_, i) => msg.data[i]));
+  const grid = $('#historyGrid');
+  const vessels = odometryVessels();
+  if (!vessels.length) {
+    grid.innerHTML = '<div class="empty-state">Waiting for odometry&hellip;</div>';
+    histVessels = new Map();
+    return;
+  }
 
-  const sensors = (sensorConfig[currentVessel] && sensorConfig[currentVessel].sensors) || [];
-  for (const s of sensors) {
-    const stype = (s.sensor_type || '').toLowerCase();
-    if (stype === 'imu') {
-      addChartPanel(grid, `IMU ${s.sensor_id} – Orientation (roll/pitch/yaw °)`, ['roll', 'pitch', 'yaw'],
-        s.sensor_topic, 'sensor_msgs/Imu', (msg) => quatToEuler(msg.orientation.x, msg.orientation.y, msg.orientation.z, msg.orientation.w));
-      addChartPanel(grid, `IMU ${s.sensor_id} – Angular Velocity`, ['p', 'q', 'r'], s.sensor_topic, 'sensor_msgs/Imu',
-        (msg) => [msg.angular_velocity.x, msg.angular_velocity.y, msg.angular_velocity.z]);
-      addChartPanel(grid, `IMU ${s.sensor_id} – Linear Acceleration`, ['ax', 'ay', 'az'], s.sensor_topic, 'sensor_msgs/Imu',
-        (msg) => [msg.linear_acceleration.x, msg.linear_acceleration.y, msg.linear_acceleration.z]);
-    } else if (stype === 'gps') {
-      addChartPanel(grid, `GPS ${s.sensor_id} – Lat/Lon/Alt`, ['lat', 'lon', 'alt'], s.sensor_topic, 'sensor_msgs/NavSatFix',
-        (msg) => [msg.latitude, msg.longitude, msg.altitude]);
-    } else if (stype === 'encoder') {
-      const panel = document.createElement('div'); panel.className = 'panel';
-      panel.innerHTML = `<h3>Encoder ${s.sensor_id}</h3><canvas class="strip"></canvas><div class="legend"></div>`;
-      grid.appendChild(panel);
-      let chart = null;
-      sub(s.sensor_topic, 'std_msgs/Float64MultiArray', (msg) => {
-        if (!chart) {
-          const series = msg.data.map((_, i) => ({ name: `a${i}`, color: PALETTE[i % PALETTE.length] }));
-          chart = new StripChart(panel.querySelector('canvas'), series);
-          panel.querySelector('.legend').innerHTML = series.map((s2) => `<span><span class="sw" style="background:${s2.color}"></span>${s2.name}</span>`).join('');
-        }
-        chart.push(msg.data);
-      });
+  grid.innerHTML = '';
+  histVessels = new Map();
+
+  for (const vessel of vessels) {
+    const block = document.createElement('div');
+    block.className = 'vessel-block';
+    block.innerHTML = `<h2><span class="vname">${escapeHtml(vessel)}</span>
+      <span class="vrate" data-rate>&ndash;</span></h2>
+      <div class="odo-grid"></div>`;
+    grid.appendChild(block);
+    const odoGrid = block.querySelector('.odo-grid');
+
+    const plots = ODO_PLOTS.map((spec) => {
+      const panel = document.createElement('div');
+      panel.className = 'panel';
+      const series = spec.series.map((n, i) => ({ name: n, color: PALETTE[i % PALETTE.length] }));
+      panel.innerHTML = `<h3>${spec.title}<span class="odo-unit">${spec.unit}</span></h3>
+        <canvas class="odo"></canvas>
+        <div class="legend">${series.map((s) =>
+          `<span><span class="sw" style="background:${s.color}"></span>${s.name}</span>`).join('')}</div>`;
+      odoGrid.appendChild(panel);
+      const plot = new TimePlot(panel.querySelector('canvas'));
+      // One entry per channel, in the same {t,v,color} shape TimePlot.render
+      // already consumes for the inspector.
+      const channels = new Map(series.map((s) => [s.name, { t: [], v: [], color: s.color }]));
+      return { spec, plot, channels };
+    });
+
+    const entry = { plots, rateStamps: [], rateEl: block.querySelector('[data-rate]') };
+    histVessels.set(vessel, entry);
+
+    const topic = `/${vessel}/odometry_sim`;
+    sub(topic, 'nav_msgs/Odometry', (msg) => onOdometry(vessel, msg));
+  }
+}
+
+function onOdometry(vessel, msg) {
+  const entry = histVessels.get(vessel);
+  if (!entry) return;
+
+  const nowMs = performance.now();
+  if (histT0 === null) histT0 = nowMs;
+  const t = (nowMs - histT0) / 1000;
+
+  entry.rateStamps.push(nowMs);
+  while (entry.rateStamps.length && nowMs - entry.rateStamps[0] > 3000) entry.rateStamps.shift();
+
+  if (histPaused) return;
+
+  const cutoff = t - Math.max(histWindowSec, 1) * 1.5;
+  for (const { spec, channels } of entry.plots) {
+    let values;
+    try {
+      values = spec.extract(msg);
+    } catch (e) {
+      continue;  // a malformed/partial message must not kill the feed
+    }
+    spec.series.forEach((name, i) => {
+      const ch = channels.get(name);
+      const v = values[i];
+      if (typeof v !== 'number' || !isFinite(v)) return;
+      ch.t.push(t); ch.v.push(v);
+      let drop = 0;
+      while (drop < ch.t.length && ch.t[drop] < cutoff) drop++;
+      if (ch.t.length - drop > HIST_MAX_POINTS) drop = ch.t.length - HIST_MAX_POINTS;
+      if (drop > 0) { ch.t.splice(0, drop); ch.v.splice(0, drop); }
+    });
+  }
+}
+
+function renderHistory() {
+  if (!histVessels.size) return;
+  const tNow = histT0 === null ? 0 : (performance.now() - histT0) / 1000;
+  for (const entry of histVessels.values()) {
+    for (const { plot, channels } of entry.plots) {
+      plot.render(channels, tNow, histWindowSec);
+    }
+    if (entry.rateEl) {
+      const s = entry.rateStamps;
+      const stale = s.length && performance.now() - s[s.length - 1] > 3000;
+      const hz = s.length > 1 ? (s.length - 1) / ((s[s.length - 1] - s[0]) / 1000) : 0;
+      entry.rateEl.textContent = (!s.length || stale) ? '0.0 Hz' : hz.toFixed(1) + ' Hz';
     }
   }
+}
+
+// Rebuild the history panels only when the set of odometry-publishing
+// vessels actually changes. The 5s topic refresh calls this on every tick,
+// and an unconditional rebuild would discard every vessel's accumulated
+// history several times a minute.
+function refreshHistoryIfVesselsChanged() {
+  const vessels = odometryVessels();
+  const current = [...histVessels.keys()];
+  const same = vessels.length === current.length && vessels.every((v, i) => v === current[i]);
+  if (same) return;
+  clearSubs();
+  buildHistoryPanels();
+}
+
+function onHistWindowChange() {
+  const v = parseFloat($('#histWindow').value);
+  if (isFinite(v) && v > 0) histWindowSec = v;
+  renderHistory();
+}
+
+function toggleHistPause() {
+  histPaused = !histPaused;
+  const b = $('#histPauseBtn');
+  b.textContent = histPaused ? 'Resume' : 'Pause';
+  b.classList.toggle('on', histPaused);
 }
 
 // ---------------------------------------------------------------------
@@ -711,6 +824,12 @@ function onLidarChange() {
   const idx = $('#lidarSelect').value;
   const lidars = lidarTopicsForVessel();
   if (idx === '' || !lidars[idx]) { $('#pcStat').textContent = ''; return; }
+  // Three.js is vendored from /static; if it failed to load, degrade to a
+  // message in this one view rather than throwing through every caller.
+  if (typeof THREE === 'undefined') {
+    $('#pcStat').textContent = 'three.js unavailable - point cloud disabled';
+    return;
+  }
   if (!pcViewer) pcViewer = new PointCloudViewer($('#pcContainer'));
   const s = lidars[idx];
   // Robust lookup - matches the defensive chain LidarSensor.js itself uses
@@ -1113,8 +1232,9 @@ function clearRawTerm() { $('#rawTerm').innerHTML = ''; }
 // --- time-series plot ------------------------------------------------
 
 // Hand-rolled Canvas 2D plot with real, human-readable axis ticks and a
-// sliding time window. Deliberately separate from StripChart above, which
-// plots sample-index vs value with no axes and a fixed point budget.
+// sliding time window. Shared by the Topic Inspector and the Time Histories
+// tab: both plot (t, value) pairs and need to show what the values and times
+// actually are, which the sample-index strip chart this replaced could not.
 class TimePlot {
   constructor(canvas) {
     this.canvas = canvas;
@@ -1345,6 +1465,9 @@ function initInspector() {
       }
       renderPlot();
     }
+    // Same rationale for Time Histories: odometry callbacks only append
+    // samples, and every vessel's plots repaint once per frame here.
+    if ($('#view-history').classList.contains('active')) renderHistory();
     requestAnimationFrame(tick);
   };
   requestAnimationFrame(tick);
@@ -1358,6 +1481,14 @@ function setView(name) {
   document.querySelectorAll('.view').forEach((v) => v.classList.toggle('active', v.id === 'view-' + name));
   if (name === 'pointcloud' && pcViewer) pcViewer.resize();
   if (name === 'inspector' && inspPlot) { inspPlot._resize(); renderPlot(); }
+  if (name === 'history') {
+    // Canvases sized while the tab was display:none have a zero-width
+    // bounding box; re-measure now that they are actually laid out.
+    for (const entry of histVessels.values()) {
+      for (const { plot } of entry.plots) plot._resize();
+    }
+    renderHistory();
+  }
 }
 
 function populateSelect(sel, items, labelFn) {
@@ -1366,10 +1497,33 @@ function populateSelect(sel, items, labelFn) {
     : '<option value="">None available</option>';
 }
 
+// Refresh every view from one freshly-fetched topic list, isolating each so
+// that a failure in one cannot silently abort the others. That is not
+// defensive padding: the camera/lidar/overlay views construct a Three.js
+// viewer, and when three.min.js is unavailable the resulting ReferenceError
+// used to propagate out of onVesselChange() and skip everything after it -
+// which is exactly how the Time Histories tab ended up never being built.
+function refreshAllViews() {
+  const steps = [
+    ['vessel views', () => { if (currentVessel !== null) onVesselChange(); }],
+    ['topic inspector', populateInspectorTopics],
+    ['time histories', refreshHistoryIfVesselsChanged],
+  ];
+  for (const [name, fn] of steps) {
+    try {
+      fn();
+    } catch (e) {
+      console.error(`[visualizer] refresh step "${name}" failed:`, e);
+    }
+  }
+}
+
 function onVesselChange() {
   currentVessel = $('#vesselSelect').value;
-  clearSubs();
-  buildHistoryPanels();
+  // Note: the Time Histories tab is NOT rebuilt here. It covers every vessel,
+  // so the dropdown does not scope it, and rebuilding would throw away the
+  // accumulated history of all vessels every time the selection changed.
+  // refreshHistoryIfVesselsChanged() owns its lifecycle instead.
   const cams = cameraTopicsForVessel(), lidars = lidarTopicsForVessel();
   populateSelect($('#cameraSelect'), cams, (s) => `Camera ${s.sensor_id}`);
   populateSelect($('#lidarSelect'), lidars, (s) => `Lidar ${s.sensor_id}`);
@@ -1413,10 +1567,7 @@ setInterval(loadSensorConfig, 5000);
 // The inspector's topic dropdown is refreshed from the same sweep, but it
 // keeps its own subscription (not in activeSubs) so that the vessel-change
 // clearSubs() above can't silently drop the topic being inspected.
-setInterval(() => fetchLiveTopics(() => {
-  if (currentVessel) onVesselChange();
-  populateInspectorTopics();
-}), 5000);
+setInterval(() => fetchLiveTopics(refreshAllViews), 5000);
 </script>
 </body>
 </html>
