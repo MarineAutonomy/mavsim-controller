@@ -40,7 +40,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger("visualizer_server")
 
-app = Flask(__name__)
+# static_folder=None disables Flask's built-in /static route, which is derived
+# from this file's own location and would otherwise shadow the static_files()
+# view below. That only works while the script happens to live next to the
+# assets: run the same file from anywhere else and every /static request 404s
+# even though STATIC_DIR is an absolute path.
+app = Flask(__name__, static_folder=None)
 
 _rosbridge_port = 9090
 
@@ -691,11 +696,13 @@ class PointCloudViewer {
     this.scene = new THREE.Scene();
     this.scene.background = new THREE.Color(0x0f1117);
     this.camera = new THREE.PerspectiveCamera(60, this._aspect(), 0.02, 1000);
-    // Points are in the lidar's own local frame (X=forward, Y=left, Z=up -
-    // see LidarSensor.js) - this is a Z-up viewer (like rviz), not Three.js's
-    // default Y-up, so the camera needs an explicit up-vector and the grid
-    // needs to lie in the XY plane instead of Three's default XZ plane.
-    this.camera.up.set(0, 0, 1);
+    // Points are in the lidar's own local frame: X=forward, Y=left, Z=DOWN
+    // (established from live data - see LIDAR_TO_BODY below). This is a
+    // Z-down viewer to match, not Three.js's default Y-up, so the camera's
+    // up-vector is -Z and the grid lies in the XY plane rather than Three's
+    // default XZ plane. Rendering this Z-down data in a Z-up viewer put the
+    // sea above the horizon and terrain below it.
+    this.camera.up.set(0, 0, -1);
     this.renderer = new THREE.WebGLRenderer({ antialias: true });
     this.renderer.setSize(container.clientWidth, container.clientHeight);
     container.appendChild(this.renderer.domElement);
@@ -726,12 +733,13 @@ class PointCloudViewer {
   }
   _aspect() { return this.container.clientWidth / Math.max(1, this.container.clientHeight); }
   _updateCamera() {
-    // Z-up spherical orbit: phi measured from +Z (the sensor's up axis),
-    // theta swept in the XY plane.
+    // Z-down spherical orbit: phi is measured from -Z, which is the sensor's
+    // UP axis in this frame, so phi<pi/2 keeps the eye above the scene
+    // looking down. theta is swept in the XY plane.
     this.camera.position.set(
       this.target.x + this.radius * Math.sin(this.phi) * Math.cos(this.theta),
       this.target.y + this.radius * Math.sin(this.phi) * Math.sin(this.theta),
-      this.target.z + this.radius * Math.cos(this.phi),
+      this.target.z - this.radius * Math.cos(this.phi),
     );
     this.camera.lookAt(this.target);
   }
@@ -744,7 +752,9 @@ class PointCloudViewer {
       if (!dragging) return;
       const dx = e.clientX - lastX, dy = e.clientY - lastY; lastX = e.clientX; lastY = e.clientY;
       this.theta -= dx * 0.01;
-      this.phi = Math.max(0.05, Math.min(Math.PI - 0.05, this.phi - dy * 0.01));
+      // "+dy" because phi is measured from -Z now (see _updateCamera): with
+      // the vertical sense flipped, dragging up must still tilt the eye up.
+      this.phi = Math.max(0.05, Math.min(Math.PI - 0.05, this.phi + dy * 0.01));
       this._updateCamera();
     });
     dom.addEventListener('wheel', (e) => {
@@ -884,9 +894,17 @@ function onOverlayChange() {
   const draw = () => {
     if (!ovLatestCamMsg) return;
     img.src = 'data:image/jpeg;base64,' + ovLatestCamMsg.data;
+    if (!img.clientWidth || !img.clientHeight) return;
     const [rw, rh] = camSensor.resolution || [img.naturalWidth || 640, img.naturalHeight || 480];
     canvas.width = rw; canvas.height = rh;
-    canvas.style.width = img.clientWidth + 'px'; canvas.style.height = img.clientHeight + 'px';
+    // Align the canvas to the IMAGE's box, not the container's. The image is
+    // centred (margin:0 auto) and capped at max-width:100%, so whenever it is
+    // narrower or shorter than the panel the two are offset - which drew
+    // points out over the letterboxing beside the picture.
+    canvas.style.width = img.clientWidth + 'px';
+    canvas.style.height = img.clientHeight + 'px';
+    canvas.style.left = img.offsetLeft + 'px';
+    canvas.style.top = img.offsetTop + 'px';
     const ctx = canvas.getContext('2d'); ctx.clearRect(0, 0, rw, rh);
     if (!ovLatestCloud) return;
     const pts = projectLidarToCamera(camSensor, lidarSensor, ovLatestCloud, rw, rh);
@@ -894,6 +912,10 @@ function onOverlayChange() {
     for (const p of pts) { ctx.beginPath(); ctx.arc(p.x, p.y, 2, 0, Math.PI * 2); ctx.fill(); }
     $('#ovStat').textContent = pts.length + ' / ' + ovLatestCloud.count + ' points in frame';
   };
+  // Redraw once a frame has actually been laid out: clientWidth/offsetLeft
+  // are 0 until the first image loads, so the draw that set img.src cannot
+  // itself position the canvas correctly.
+  img.addEventListener('load', draw);
   ovCamSub = { topic: camSensor.sensor_topic, cb: (msg) => { ovLatestCamMsg = msg; draw(); } };
   ovLidarSub = { topic: lidarSensor.sensor_topic, cb: (msg) => { ovLatestCloud = decodePointCloud2(msg); draw(); } };
   ros.subscribe(ovCamSub.topic, 'sensor_msgs/CompressedImage', ovCamSub.cb);
@@ -925,19 +947,31 @@ function makePoseObject(sensor) {
   return obj;
 }
 
-// PointCloud2 points arrive in the lidar's OWN local frame, which
-// LidarSensor.js defines as X=forward, Y=left, Z=up (its ray directions are
-// built as [cos(el)cos(az), cos(el)sin(az), sin(el)], so azimuth sweeps X-Y
-// and elevation is Z).
+// PointCloud2 points arrive in the lidar's OWN local frame: X=forward,
+// Y=left, Z=DOWN. The Z sense was established from live data rather than
+// from LidarSensor.js's ray formula, whose comment claims Z=up:
 //
-// The mounting poses live in a parent frame with the opposite handedness on
-// two axes: the camera's [-90, 0, 90] mounting puts its forward on +X but
-// its up on -Z and its right on +Y, i.e. Y=right and Z=down. Converting a
-// lidar point into that parent frame is therefore a 180-degree roll about X,
-// (x, y, z) -> (x, -y, -z). Without it the overlay is mirrored on both axes:
-// targets to the left project to the right of the image and targets above
-// project below, which is the bulk of any visible misalignment.
-const LIDAR_TO_BODY_ROLL = new THREE.Matrix4().makeRotationX(Math.PI);
+//   water returns (<10m, the surface 0.2m below a mast-mounted sensor)
+//       ->  z = +0.04 .. +0.20   i.e. BELOW the sensor is +z
+//   cliff returns (>40m, terrain towering over the vessel)
+//       ->  z = -4.80 .. -0.30   i.e. ABOVE the sensor is -z
+//
+// Read as Z=down those become a water surface 0.04-0.20m below the sensor
+// and cliffs up to 4.8m above it, which matches the scene; read as Z=up
+// they are inverted. The same sample puts far cliff returns at y<0 (34 of
+// 36) while the cliff is on the RIGHT of the camera image, confirming
+// +Y=left.
+//
+// The mounting poses are expressed in the vessel's NED body frame -
+// X=forward, Y=right, Z=down - which the camera's [-90, 0, 90] mounting
+// confirms (forward +X, up -Z, right +Y). So the two frames agree on X and
+// Z and differ only in the sign of Y, and the conversion is a mirror in Y,
+// not a rotation: X=fwd/Y=left/Z=down is left-handed, so this legitimately
+// has determinant -1 and cannot be written as makeRotationX/Y/Z.
+//
+// Flipping Z as well (a 180-degree roll) inverts the vertical: the cliff
+// tops hang below the horizon instead of standing above it.
+const LIDAR_TO_BODY = new THREE.Matrix4().makeScale(1, -1, 1);
 
 function projectLidarToCamera(camSensor, lidarSensor, cloud, imgW, imgH) {
   const lidarObj = makePoseObject(lidarSensor);
@@ -956,7 +990,7 @@ function projectLidarToCamera(camSensor, lidarSensor, cloud, imgW, imgH) {
     // Axis convention first, then the mounting pose ONCE. localToWorld() was
     // previously applied to points that were already in the lidar's frame,
     // which added the lidar's own location/rotation a second time.
-    v.applyMatrix4(LIDAR_TO_BODY_ROLL);
+    v.applyMatrix4(LIDAR_TO_BODY);
     v.applyMatrix4(lidarObj.matrixWorld);
     local.copy(v);
     projCam.worldToLocal(local);

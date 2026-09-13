@@ -5,19 +5,22 @@ Geometry checks for the camera/lidar overlay in visualizer_server.py.
 The overlay projects lidar points into the camera image. Two frames meet
 there and they do not share a handedness:
 
-  - Lidar points arrive in the lidar's OWN local frame. LidarSensor.js builds
-    its rays as [cos(el)cos(az), cos(el)sin(az), sin(el)], so X is forward,
-    azimuth sweeps X->Y (Y=left) and elevation is Z (Z=up).
-  - sensor_location/sensor_orientation are expressed in a parent frame where
-    Y=right and Z=down. That is forced by the real camera mounting
-    [-90, 0, 90], which puts the camera's forward on +X, its up on -Z and
-    its right on +Y.
+  - Lidar points arrive in the lidar's OWN local frame: X=forward, Y=left,
+    Z=DOWN. The Z sense comes from live data, not from LidarSensor.js's ray
+    formula (whose comment claims Z=up): water returns under a sensor 0.2m
+    above the surface come back at z=+0.04..+0.20, and cliffs towering over
+    the vessel at z=-4.80..-0.30. Read as Z=down those are a surface just
+    below the sensor and terrain well above it, matching the scene.
+  - sensor_location/sensor_orientation are expressed in the vessel's NED body
+    frame: X=forward, Y=right, Z=down. That is forced by the real camera
+    mounting [-90, 0, 90], which puts the camera's forward on +X, its up on
+    -Z and its right on +Y.
 
-Converting between them is a 180 degree roll about X. Without it the overlay
-is mirrored on both axes - left projects right, up projects down - which is
-the bulk of any visible misalignment. Separately, the points are already in
-the lidar frame when they arrive, so the lidar's mounting pose must be
-applied exactly once.
+The two agree on X and Z and differ only in the sign of Y, so the conversion
+is a mirror in Y. It has determinant -1 and is deliberately not a rotation:
+X=fwd/Y=left/Z=down is left-handed. Flipping Z as well inverts the vertical,
+hanging cliff tops below the horizon. Separately, the points are already in
+the lidar frame when they arrive, so the mounting pose must be applied once.
 
 These tests replicate the projection in numpy rather than driving the
 browser, so they run in the Python-only CI. The expected pixel values were
@@ -67,30 +70,38 @@ def _pose(loc, ori_deg):
     return np.array(loc, dtype=float), _rz(y) @ _ry(p) @ _rx(r)
 
 
-# (x, y, z) -> (x, -y, -z): lidar frame (Y=left, Z=up) into the mounting
-# frame (Y=right, Z=down). Mirrors LIDAR_TO_BODY_ROLL in visualizer_server.py.
-def _lidar_to_body_roll():
-    return np.diag([1.0, -1.0, -1.0])
+# (x, y, z) -> (x, -y, z): lidar frame (Y=left, Z=down) into the NED mounting
+# frame (Y=right, Z=down). Mirrors LIDAR_TO_BODY in visualizer_server.py.
+def _lidar_to_body():
+    return np.diag([1.0, -1.0, 1.0])
 
 
 def _lidar_ray(azimuth_deg, elevation_deg, rng=15.0):
-    """A ray exactly as LidarSensor._generateRayDirections() builds it."""
+    """A point at this azimuth/elevation in the lidar's measured frame.
+
+    X=forward, Y=left, Z=down - so a positive elevation (above the sensor)
+    is a NEGATIVE z.
+    """
     a, e = math.radians(azimuth_deg), math.radians(elevation_deg)
     return np.array([rng * math.cos(e) * math.cos(a),
                      rng * math.cos(e) * math.sin(a),
-                     rng * math.sin(e)])
+                     -rng * math.sin(e)])
 
 
-def project(point_lidar, apply_roll=True, double_pose=False):
+def project(point_lidar, apply_flip=True, flip_z_too=False, double_pose=False):
     """Project a lidar-frame point to pixels; returns None if not visible.
 
-    apply_roll/double_pose exist to reproduce the two bugs this guards
-    against, so the tests can assert the broken forms actually fail.
+    apply_flip/flip_z_too/double_pose reproduce the bugs this guards against,
+    so the tests can assert the broken forms actually fail.
     """
     t_l, r_l = _pose(LIDAR_LOC, LIDAR_ORI)
     t_c, r_c = _pose(CAM_LOC, CAM_ORI)
 
-    p = _lidar_to_body_roll() @ point_lidar if apply_roll else np.array(point_lidar, float)
+    if apply_flip:
+        m = np.diag([1.0, -1.0, -1.0]) if flip_z_too else _lidar_to_body()
+        p = m @ point_lidar
+    else:
+        p = np.array(point_lidar, float)
     p_body = r_l @ p + t_l
     if double_pose:
         p_body = r_l @ p_body + t_l
@@ -164,12 +175,21 @@ class TestOverlayRegressions(unittest.TestCase):
 
     CX, CY = IMG_W / 2, IMG_H / 2
 
-    def test_without_roll_the_overlay_is_mirrored(self):
-        """Skipping the axis conversion mirrors both axes - the original bug."""
-        left = project(_lidar_ray(20, 0), apply_roll=False)
-        up = project(_lidar_ray(0, 10), apply_roll=False)
+    def test_without_the_flip_the_overlay_is_mirrored_horizontally(self):
+        """Skipping the Y conversion mirrors left/right - the original bug."""
+        left = project(_lidar_ray(20, 0), apply_flip=False)
         self.assertGreater(left[0], self.CX, "unfixed: left target lands right")
-        self.assertGreater(up[1], self.CY, "unfixed: up target lands below")
+
+    def test_flipping_z_as_well_inverts_the_vertical(self):
+        """A 180-degree roll also flips Z, hanging cliffs below the horizon.
+
+        This was shipped briefly and is what made the overlay look upside
+        down against a real scene.
+        """
+        up = project(_lidar_ray(0, 10), flip_z_too=True)
+        down = project(_lidar_ray(0, -10), flip_z_too=True)
+        self.assertGreater(up[1], self.CY, "over-flipped: up target lands below")
+        self.assertLess(down[1], self.CY, "over-flipped: down target lands above")
 
     def test_double_applying_the_lidar_pose_shifts_points(self):
         """Applying the mounting pose twice displaces the projection."""
