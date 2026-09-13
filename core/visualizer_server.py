@@ -951,31 +951,32 @@ function makePoseObject(sensor) {
   return obj;
 }
 
-// PointCloud2 points arrive in the lidar's OWN local frame: X=forward,
-// Y=left, Z=DOWN. The Z sense was established from live data rather than
-// from LidarSensor.js's ray formula, whose comment claims Z=up:
+// PointCloud2 points arrive in the lidar's OWN local frame, and that frame
+// is plain NED: X=forward, Y=right, Z=down - the SAME frame the mounting
+// poses (sensor_location / sensor_orientation) are expressed in. No axis
+// conversion is needed between the two.
 //
-//   water returns (<10m, the surface 0.2m below a mast-mounted sensor)
-//       ->  z = +0.04 .. +0.20   i.e. BELOW the sensor is +z
-//   cliff returns (>40m, terrain towering over the vessel)
-//       ->  z = -4.80 .. -0.30   i.e. ABOVE the sensor is -z
+// That is a consequence of how LidarSensor.js produces the points: it
+// raycasts in Three.js world space and then calls sensorFrame.worldToLocal()
+// on each hit, where sensorFrame is a child of the vessel object placed at
+// sensor_location with sensor_orientation. worldToLocal inverts the entire
+// parent chain, including whatever NED->Three.js remap the vessel applies,
+// so the local coordinates land in exactly the NED body frame the mounting
+// pose was written in. (The "X=forward, Y=left, Z=up" comment in that file
+// describes Three.js's native axes, not the frame the points are in.)
 //
-// Read as Z=down those become a water surface 0.04-0.20m below the sensor
-// and cliffs up to 4.8m above it, which matches the scene; read as Z=up
-// they are inverted. The same sample puts far cliff returns at y<0 (34 of
-// 36) while the cliff is on the RIGHT of the camera image, confirming
-// +Y=left.
+// Established from live data, using only range and height so no frame
+// assumption is baked into the test:
+//   water returns (<2m) under a sensor mounted 0.2m up   -> z = +0.20   (down is +z)
+//   the receding cliff on the LEFT of the camera image   -> 100% y < 0  (left is -y)
+//   the close, tall cliff on the RIGHT of the image      -> 100% y > 0  (right is +y)
 //
-// The mounting poses are expressed in the vessel's NED body frame -
-// X=forward, Y=right, Z=down - which the camera's [-90, 0, 90] mounting
-// confirms (forward +X, up -Z, right +Y). So the two frames agree on X and
-// Z and differ only in the sign of Y, and the conversion is a mirror in Y,
-// not a rotation: X=fwd/Y=left/Z=down is left-handed, so this legitimately
-// has determinant -1 and cannot be written as makeRotationX/Y/Z.
-//
-// Flipping Z as well (a 180-degree roll) inverts the vertical: the cliff
-// tops hang below the horizon instead of standing above it.
-const LIDAR_TO_BODY = new THREE.Matrix4().makeScale(1, -1, 1);
+// Two wrong conversions were shipped before this: a 180-degree roll, which
+// inverted the vertical, and then a mirror in Y alone, which swapped left
+// and right - drawing the close cliff's returns over the far cliff and
+// vice versa, so points overshot the low cliff and fell short of the tall
+// one. Both came from misreading which cliff was which in the image.
+const LIDAR_TO_BODY = new THREE.Matrix4().identity();
 
 function projectLidarToCamera(camSensor, lidarSensor, cloud, imgW, imgH) {
   const lidarObj = makePoseObject(lidarSensor);

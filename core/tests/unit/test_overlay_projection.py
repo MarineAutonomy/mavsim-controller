@@ -2,25 +2,30 @@
 """
 Geometry checks for the camera/lidar overlay in visualizer_server.py.
 
-The overlay projects lidar points into the camera image. Two frames meet
-there and they do not share a handedness:
+The overlay projects lidar points into the camera image. The lidar's point
+frame and the mounting-pose frame are the SAME frame - plain NED, X=forward,
+Y=right, Z=down - so no axis conversion is applied between them.
 
-  - Lidar points arrive in the lidar's OWN local frame: X=forward, Y=left,
-    Z=DOWN. The Z sense comes from live data, not from LidarSensor.js's ray
-    formula (whose comment claims Z=up): water returns under a sensor 0.2m
-    above the surface come back at z=+0.04..+0.20, and cliffs towering over
-    the vessel at z=-4.80..-0.30. Read as Z=down those are a surface just
-    below the sensor and terrain well above it, matching the scene.
-  - sensor_location/sensor_orientation are expressed in the vessel's NED body
-    frame: X=forward, Y=right, Z=down. That is forced by the real camera
-    mounting [-90, 0, 90], which puts the camera's forward on +X, its up on
-    -Z and its right on +Y.
+That was established from live data using only range and height, which no
+frame convention can alter:
 
-The two agree on X and Z and differ only in the sign of Y, so the conversion
-is a mirror in Y. It has determinant -1 and is deliberately not a rotation:
-X=fwd/Y=left/Z=down is left-handed. Flipping Z as well inverts the vertical,
-hanging cliff tops below the horizon. Separately, the points are already in
-the lidar frame when they arrive, so the mounting pose must be applied once.
+  - water returns (<2m) under a sensor mounted 0.2m up -> z = +0.20, so
+    down is +z;
+  - the receding cliff on the LEFT of the camera image -> 100% y < 0, and
+    the close, tall cliff on the RIGHT -> 100% y > 0, so right is +y.
+
+Two wrong conversions were shipped before this was settled: a 180-degree
+roll, which inverted the vertical, and then a mirror in Y alone, which
+swapped left and right. The mirror drew the close cliff's returns over the
+far cliff and vice versa, so the points overshot the low cliff and fell
+short of the tall one - an asymmetry that looked like a height error. It
+came from misreading which cliff was which in the image, and every check
+that "confirmed" it compared the projection against a prediction that had
+the same assumption baked in. The tests below therefore classify points by
+RANGE and check which half of the image they land in.
+
+Separately, the points are already in the lidar frame when they arrive, so
+the mounting pose must be applied exactly once.
 
 These tests replicate the projection in numpy rather than driving the
 browser, so they run in the Python-only CI. The expected pixel values were
@@ -70,17 +75,17 @@ def _pose(loc, ori_deg):
     return np.array(loc, dtype=float), _rz(y) @ _ry(p) @ _rx(r)
 
 
-# (x, y, z) -> (x, -y, z): lidar frame (Y=left, Z=down) into the NED mounting
-# frame (Y=right, Z=down). Mirrors LIDAR_TO_BODY in visualizer_server.py.
+# Identity: the lidar frame IS the NED mounting frame. Mirrors LIDAR_TO_BODY
+# in visualizer_server.py.
 def _lidar_to_body():
-    return np.diag([1.0, -1.0, 1.0])
+    return np.eye(3)
 
 
 def _lidar_ray(azimuth_deg, elevation_deg, rng=15.0):
-    """A point at this azimuth/elevation in the lidar's measured frame.
+    """A point at this azimuth/elevation in the lidar's NED frame.
 
-    X=forward, Y=left, Z=down - so a positive elevation (above the sensor)
-    is a NEGATIVE z.
+    X=forward, Y=RIGHT, Z=down. A positive azimuth is to the RIGHT and a
+    positive elevation (above the sensor) is a NEGATIVE z.
     """
     a, e = math.radians(azimuth_deg), math.radians(elevation_deg)
     return np.array([rng * math.cos(e) * math.cos(a),
@@ -88,20 +93,21 @@ def _lidar_ray(azimuth_deg, elevation_deg, rng=15.0):
                      -rng * math.sin(e)])
 
 
-def project(point_lidar, apply_flip=True, flip_z_too=False, double_pose=False):
+def project(point_lidar, mirror_y=False, flip_z_too=False, double_pose=False):
     """Project a lidar-frame point to pixels; returns None if not visible.
 
-    apply_flip/flip_z_too/double_pose reproduce the bugs this guards against,
+    mirror_y/flip_z_too/double_pose reproduce the bugs this guards against,
     so the tests can assert the broken forms actually fail.
     """
     t_l, r_l = _pose(LIDAR_LOC, LIDAR_ORI)
     t_c, r_c = _pose(CAM_LOC, CAM_ORI)
 
-    if apply_flip:
-        m = np.diag([1.0, -1.0, -1.0]) if flip_z_too else _lidar_to_body()
-        p = m @ point_lidar
-    else:
-        p = np.array(point_lidar, float)
+    m = _lidar_to_body()
+    if mirror_y:
+        m = np.diag([1.0, -1.0, 1.0])
+    if flip_z_too:
+        m = np.diag([1.0, -1.0, -1.0])
+    p = m @ point_lidar
     p_body = r_l @ p + t_l
     if double_pose:
         p_body = r_l @ p_body + t_l
@@ -127,15 +133,15 @@ class TestOverlayProjection(unittest.TestCase):
         # level with the lidar is slightly below the optical axis.
         self.assertAlmostEqual(px[1], self.CY, delta=6)
 
-    def test_left_target_projects_left_of_centre(self):
-        px = project(_lidar_ray(20, 0))
-        self.assertIsNotNone(px)
-        self.assertLess(px[0], self.CX, "a target to the left must project left")
-
     def test_right_target_projects_right_of_centre(self):
-        px = project(_lidar_ray(-20, 0))
+        px = project(_lidar_ray(20, 0))          # +azimuth = right in NED
         self.assertIsNotNone(px)
         self.assertGreater(px[0], self.CX, "a target to the right must project right")
+
+    def test_left_target_projects_left_of_centre(self):
+        px = project(_lidar_ray(-20, 0))
+        self.assertIsNotNone(px)
+        self.assertLess(px[0], self.CX, "a target to the left must project left")
 
     def test_up_target_projects_above_centre(self):
         px = project(_lidar_ray(0, 10))
@@ -151,16 +157,16 @@ class TestOverlayProjection(unittest.TestCase):
         self.assertIsNone(project(_lidar_ray(180, 0)))
 
     def test_horizontal_is_symmetric(self):
-        left = project(_lidar_ray(20, 0))
-        right = project(_lidar_ray(-20, 0))
-        self.assertAlmostEqual(left[0] - self.CX, -(right[0] - self.CX), delta=1)
+        right = project(_lidar_ray(20, 0))
+        left = project(_lidar_ray(-20, 0))
+        self.assertAlmostEqual(right[0] - self.CX, -(left[0] - self.CX), delta=1)
 
     def test_matches_browser_reference_values(self):
         """Pixel values produced by the real JS under vendored three.min.js."""
         for (az, el), expect in {
             (0, 0):   (320.0, 241.4),
-            (20, 0):  (170.8, 241.5),
-            (-20, 0): (469.2, 241.5),
+            (20, 0):  (469.2, 241.5),   # +az = right
+            (-20, 0): (170.8, 241.5),
             (0, 10):  (320.0, 169.1),
             (0, -10): (320.0, 313.7),
         }.items():
@@ -175,10 +181,14 @@ class TestOverlayRegressions(unittest.TestCase):
 
     CX, CY = IMG_W / 2, IMG_H / 2
 
-    def test_without_the_flip_the_overlay_is_mirrored_horizontally(self):
-        """Skipping the Y conversion mirrors left/right - the original bug."""
-        left = project(_lidar_ray(20, 0), apply_flip=False)
-        self.assertGreater(left[0], self.CX, "unfixed: left target lands right")
+    def test_mirroring_y_swaps_left_and_right(self):
+        """The mirror-in-Y that was shipped: a right target lands left.
+
+        On a real scene this drew the close cliff's returns over the far
+        cliff and vice versa, which read as a height inconsistency.
+        """
+        right = project(_lidar_ray(20, 0), mirror_y=True)
+        self.assertLess(right[0], self.CX, "mirrored: right target lands left")
 
     def test_flipping_z_as_well_inverts_the_vertical(self):
         """A 180-degree roll also flips Z, hanging cliffs below the horizon.
@@ -279,3 +289,59 @@ class TestPointCloudOrbit(unittest.TestCase):
         e1 = self._eye(theta - 0.2, phi)
         self.assertGreater(float((e1 - e0) @ self._screen_right(e0)), 0,
                            "theta -= dx moves the eye right; that is the inverted feel")
+
+
+@unittest.skipIf(np is None, "numpy not available")
+class TestOverlayAgainstRealScene(unittest.TestCase):
+    """Project real lidar returns and check they land on the correct cliff.
+
+    overlay_scene_fixture.json holds returns captured from a live session in
+    which the lidar was deliberately offset 2m to starboard. The points are
+    classified by RANGE and HEIGHT only - the receding cliff is >40m away,
+    the tall one is 8-18m away - so the test carries no assumption about
+    which sign of y is left. In the camera image the receding cliff is on
+    the left and the tall one on the right, and a correct projection must
+    put each in its own half.
+
+    This is the check that would have caught the mirror-in-Y: the synthetic
+    tests above pass under a mirrored convention because their expected
+    values were derived under the same convention.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import json
+        path = os.path.join(os.path.dirname(__file__), 'overlay_scene_fixture.json')
+        with open(path) as f:
+            cls.fix = json.load(f)
+
+    def _project_all(self, points, lidar_loc, **kw):
+        global LIDAR_LOC
+        saved = LIDAR_LOC
+        try:
+            LIDAR_LOC = lidar_loc
+            out = [project(np.array(p, float), **kw) for p in points]
+        finally:
+            LIDAR_LOC = saved
+        return [p for p in out if p is not None]
+
+    def test_far_left_cliff_lands_in_left_half(self):
+        pts = self._project_all(self.fix['far_left_cliff'], self.fix['lidar_location'])
+        self.assertTrue(pts)
+        mean_x = sum(p[0] for p in pts) / len(pts)
+        self.assertLess(mean_x, IMG_W / 2, f"far cliff drawn right (x={mean_x:.0f})")
+
+    def test_close_right_cliff_lands_in_right_half(self):
+        pts = self._project_all(self.fix['close_right_cliff'], self.fix['lidar_location'])
+        self.assertTrue(pts)
+        mean_x = sum(p[0] for p in pts) / len(pts)
+        self.assertGreater(mean_x, IMG_W / 2, f"close cliff drawn left (x={mean_x:.0f})")
+
+    def test_mirror_in_y_swaps_the_cliffs(self):
+        """The shipped bug: with the mirror, each cliff lands on the wrong side."""
+        far = self._project_all(self.fix['far_left_cliff'], self.fix['lidar_location'], mirror_y=True)
+        close = self._project_all(self.fix['close_right_cliff'], self.fix['lidar_location'], mirror_y=True)
+        far_x = sum(p[0] for p in far) / len(far)
+        close_x = sum(p[0] for p in close) / len(close)
+        self.assertGreater(far_x, IMG_W / 2, "mirror should push the far cliff right")
+        self.assertLess(close_x, IMG_W / 2, "mirror should push the close cliff left")
