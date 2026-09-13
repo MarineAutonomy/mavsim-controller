@@ -112,14 +112,44 @@ def _detect_gpu_available() -> bool:
 _NAV_MAX_ATTEMPTS = 5
 _NAV_RETRY_DELAY_SECONDS = 3
 
-# Watchdog: if the page produces no console output at all (not even routine
-# per-frame logging) for this long, the renderer is presumed stuck rather
-# than just slow, and gets restarted. Chosen well above normal page-load /
-# first-frame latency under SwiftShader (observed single-digit seconds) to
-# avoid false positives, while still recovering well within a typical
-# session instead of leaving sensor streaming dead indefinitely.
+# Watchdog: restart the browser if the renderer stops making progress.
+#
+# Liveness is measured by polling a requestAnimationFrame counter installed
+# in the page, NOT by watching console output. Console chatter is only a
+# proxy for "the app is logging", which is a different thing from "the
+# renderer is running": the frontend logs heavily while building the scene
+# and then goes quiet once it settles into steady-state rendering, so a
+# console-based watchdog reads a perfectly healthy tab as stuck.
+#
+# That is not hypothetical - it was the observed failure. Measured against a
+# live two-vessel session on a Quadro RTX 8000 (hardware WebGL confirmed via
+# UNMASKED_RENDERER_WEBGL, so not a SwiftShader effect), an observer tab left
+# to run without a watchdog reported:
+#
+#   t=10s  ~60 fps   console quiet   0s
+#   t=20s   ~5 fps   console quiet  59s   <- old watchdog fired here
+#   t=30s  ~49 fps   console quiet  69s   <- and here
+#   t=40s  ~53 fps   console quiet   0s
+#   t=60s  ~53 fps   console quiet  20s
+#
+# The tab dips during scene/BVH construction, goes quiet, and then recovers
+# to a steady ~53 fps. The old watchdog killed it mid-dip every time, so the
+# session never reached steady state and camera/lidar frames never flowed -
+# the browser was restarted ~once a minute indefinitely.
 _WATCHDOG_TIMEOUT_SECONDS = 45
 _WATCHDOG_CHECK_INTERVAL_SECONDS = 5
+# Frames that must accumulate between two checks for the renderer to count as
+# alive. The dip above bottomed out near 5 fps (~25 frames per 5s check), so
+# a single-digit threshold distinguishes "slow but progressing" from "stopped"
+# without re-introducing the false positive this replaced.
+_WATCHDOG_MIN_FRAMES = 2
+# Grace period after navigation before the watchdog arms at all: initial
+# scene load, terrain simplification and BVH construction are legitimately
+# long and partly synchronous, and must not be mistaken for a hang.
+_WATCHDOG_STARTUP_GRACE_SECONDS = 90
+# Evaluating in a busy page can itself block; treat a slow probe as "no
+# answer this round" rather than letting it wedge the watchdog thread.
+_WATCHDOG_PROBE_TIMEOUT_MS = 5000
 # Best-effort graceful close before falling back to a hard kill of the
 # browser's OS process - a stuck renderer can make even close() hang.
 _BROWSER_CLOSE_TIMEOUT_MS = 5000
@@ -148,22 +178,19 @@ def _run_observer_session(playwright, url, is_running, chromium_args):
     Returns "stuck" if the watchdog tripped (caller should relaunch),
     or "stopped" if is_running() went False (caller should exit).
     """
-    last_activity = [time.time()]
-
-    def _touch(*_args):
-        last_activity[0] = time.time()
-
     browser = playwright.chromium.launch(headless=True, args=chromium_args)
     try:
         page = browser.new_page(viewport={"width": 1280, "height": 720})
-        page.on("console", lambda msg: (_touch(), logger.info(f"[browser console] {msg.type}: {msg.text}")))
-        page.on("pageerror", lambda exc: (_touch(), logger.warning(f"[browser page error] {exc}")))
+        # Console output is forwarded for diagnostics only - it is no longer
+        # the watchdog's liveness signal (see _WATCHDOG_TIMEOUT_SECONDS).
+        page.on("console", lambda msg: logger.info(f"[browser console] {msg.type}: {msg.text}"))
+        page.on("pageerror", lambda exc: logger.warning(f"[browser page error] {exc}"))
         # Web Worker console output (e.g. LidarStreamWorker.js) isn't
         # surfaced via the page-level console listener - Workers only
         # support "console" and "close" events, not "pageerror".
         page.on("worker", lambda w: (
             logger.info(f"[worker created] {w.url}"),
-            w.on("console", lambda msg: (_touch(), logger.info(f"[worker console] {msg.type}: {msg.text}"))),
+            w.on("console", lambda msg: logger.info(f"[worker console] {msg.type}: {msg.text}")),
             w.on("close", lambda w2: logger.warning(f"[worker closed] {w2.url}")),
         ))
 
@@ -173,7 +200,6 @@ def _run_observer_session(playwright, url, is_running, chromium_args):
                 logger.info(f"Navigating to observer URL (attempt {attempt}/{_NAV_MAX_ATTEMPTS})...")
                 page.goto(url, wait_until="load", timeout=30000)
                 loaded = True
-                last_activity[0] = time.time()
                 logger.info("Observer page loaded - sensor streaming should now be active")
                 break
             except Exception as e:
@@ -188,19 +214,100 @@ def _run_observer_session(playwright, url, is_running, chromium_args):
             )
             return "stuck"
 
+        # Install the liveness counter the watchdog polls. Kept deliberately
+        # tiny and self-contained: it must not depend on any app internals,
+        # so it keeps answering even if the frontend's own state machine is
+        # wedged - that distinction is the whole point of the check.
+        _install_liveness_counter(page)
+
+        loaded_at = time.time()
+        last_progress = time.time()
+        last_frames = -1
         while is_running():
             time.sleep(_WATCHDOG_CHECK_INTERVAL_SECONDS)
-            idle_for = time.time() - last_activity[0]
-            if idle_for > _WATCHDOG_TIMEOUT_SECONDS:
+
+            frames = _read_frame_count(page)
+            now = time.time()
+
+            if frames is None:
+                # Probe failed (page busy, navigating, or context torn down).
+                # Not evidence of a hang on its own; let the timeout below
+                # decide if this keeps up.
+                pass
+            else:
+                if last_frames < 0 or frames - last_frames >= _WATCHDOG_MIN_FRAMES:
+                    last_progress = now
+                # A reload resets the counter; treat a decrease as progress
+                # rather than as a stall.
+                if frames < last_frames:
+                    last_progress = now
+                last_frames = frames
+
+            if now - loaded_at < _WATCHDOG_STARTUP_GRACE_SECONDS:
+                continue
+
+            stalled_for = now - last_progress
+            if stalled_for > _WATCHDOG_TIMEOUT_SECONDS:
                 logger.warning(
-                    f"No browser activity for {idle_for:.0f}s (>{_WATCHDOG_TIMEOUT_SECONDS}s "
-                    "threshold) - renderer appears stuck (known SwiftShader software-rendering "
-                    "limitation under heavy sensor load). Restarting the observer browser."
+                    f"Renderer produced no frames for {stalled_for:.0f}s "
+                    f"(>{_WATCHDOG_TIMEOUT_SECONDS}s threshold) - presumed stuck. "
+                    "Restarting the observer browser."
                 )
                 return "stuck"
         return "stopped"
     finally:
         _close_browser(browser)
+
+
+def _install_liveness_counter(page):
+    """Install a requestAnimationFrame counter used as the watchdog's
+    liveness signal, and re-install it after any navigation (a reload
+    discards it along with the rest of the page's JS state)."""
+    script = """() => {
+      if (window.__observerFrames !== undefined) return;
+      window.__observerFrames = 0;
+      const tick = () => { window.__observerFrames++; requestAnimationFrame(tick); };
+      requestAnimationFrame(tick);
+    }"""
+    try:
+        page.evaluate(script)
+    except Exception as e:
+        logger.debug(f"Could not install liveness counter: {e}")
+    # add_init_script runs on every subsequent document, so an in-page
+    # route change or reload doesn't leave the watchdog blind.
+    try:
+        page.add_init_script(
+            "window.__observerFrames = 0;"
+            "(function t(){ window.__observerFrames++; requestAnimationFrame(t); })();"
+        )
+    except Exception as e:
+        logger.debug(f"Could not register liveness init script: {e}")
+
+
+def _read_frame_count(page):
+    """Read the liveness counter, returning None if the page can't answer
+    in time. A busy main thread can make evaluate() slow, which must not
+    be conflated with the renderer having stopped."""
+    try:
+        # A stuck renderer can make evaluate() hang, not just return slowly;
+        # without this the watchdog thread would block on the very condition
+        # it exists to detect.
+        page.set_default_timeout(_WATCHDOG_PROBE_TIMEOUT_MS)
+        value = page.evaluate(
+            "() => window.__observerFrames === undefined ? null : window.__observerFrames"
+        )
+    except Exception as e:
+        logger.debug(f"Liveness probe failed: {e}")
+        return None
+    if value is None:
+        # Counter missing (fresh document after a navigation) - reinstall it
+        # so the next round has something to read.
+        _install_liveness_counter(page)
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _close_browser(browser):
