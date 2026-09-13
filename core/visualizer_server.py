@@ -696,12 +696,13 @@ class PointCloudViewer {
     this.scene = new THREE.Scene();
     this.scene.background = new THREE.Color(0x0f1117);
     this.camera = new THREE.PerspectiveCamera(60, this._aspect(), 0.02, 1000);
-    // Points are in the lidar's own local frame: X=forward, Y=left, Z=DOWN
-    // (established from live data - see LIDAR_TO_BODY below). This is a
-    // Z-down viewer to match, not Three.js's default Y-up, so the camera's
-    // up-vector is -Z and the grid lies in the XY plane rather than Three's
-    // default XZ plane. Rendering this Z-down data in a Z-up viewer put the
-    // sea above the horizon and terrain below it.
+    // Points are in the lidar's own local frame, which is plain NED:
+    // X=forward, Y=right, Z=DOWN (see projectLidarToCamera below for how
+    // that was established from live data). This is a Z-down viewer to
+    // match, not Three.js's default Y-up, so the camera's up-vector is -Z
+    // and the grid lies in the XY plane rather than Three's default XZ
+    // plane. Rendering this Z-down data in a Z-up viewer put the sea above
+    // the horizon and terrain below it.
     this.camera.up.set(0, 0, -1);
     this.renderer = new THREE.WebGLRenderer({ antialias: true });
     this.renderer.setSize(container.clientWidth, container.clientHeight);
@@ -953,8 +954,9 @@ function makePoseObject(sensor) {
 
 // PointCloud2 points arrive in the lidar's OWN local frame, and that frame
 // is plain NED: X=forward, Y=right, Z=down - the SAME frame the mounting
-// poses (sensor_location / sensor_orientation) are expressed in. No axis
-// conversion is needed between the two.
+// poses (sensor_location / sensor_orientation) are expressed in. There is
+// therefore NO axis conversion between them: a point goes straight through
+// the lidar's mounting matrix into the body frame.
 //
 // That is a consequence of how LidarSensor.js produces the points: it
 // raycasts in Three.js world space and then calls sensorFrame.worldToLocal()
@@ -973,10 +975,15 @@ function makePoseObject(sensor) {
 //
 // Two wrong conversions were shipped before this: a 180-degree roll, which
 // inverted the vertical, and then a mirror in Y alone, which swapped left
-// and right - drawing the close cliff's returns over the far cliff and
-// vice versa, so points overshot the low cliff and fell short of the tall
-// one. Both came from misreading which cliff was which in the image.
-const LIDAR_TO_BODY = new THREE.Matrix4().identity();
+// and right - drawing the close cliff's returns over the far cliff and vice
+// versa, so points overshot the low cliff and fell short of the tall one.
+// Both came from misreading which cliff was which in the image.
+//
+// If a conversion ever does become necessary here, it must be a proper
+// rotation (determinant +1). A reflection silently swaps handedness, which
+// is exactly how the mirror above turned a left/right error into something
+// that looked like a height error. Every transform in this projection is a
+// rotation plus a translation, and it should stay that way.
 
 function projectLidarToCamera(camSensor, lidarSensor, cloud, imgW, imgH) {
   const lidarObj = makePoseObject(lidarSensor);
@@ -992,10 +999,9 @@ function projectLidarToCamera(camSensor, lidarSensor, cloud, imgW, imgH) {
   const n = cloud.count;
   for (let i = 0; i < n; i++) {
     v.set(cloud.positions[i * 3], cloud.positions[i * 3 + 1], cloud.positions[i * 3 + 2]);
-    // Axis convention first, then the mounting pose ONCE. localToWorld() was
-    // previously applied to points that were already in the lidar's frame,
-    // which added the lidar's own location/rotation a second time.
-    v.applyMatrix4(LIDAR_TO_BODY);
+    // Points are already in the lidar's frame, so the mounting pose is
+    // applied exactly ONCE. (localToWorld() was previously used here on
+    // points that were already lidar-local, which applied it twice.)
     v.applyMatrix4(lidarObj.matrixWorld);
     local.copy(v);
     projCam.worldToLocal(local);
