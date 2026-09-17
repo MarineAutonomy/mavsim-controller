@@ -1555,10 +1555,34 @@ function setView(name) {
   }
 }
 
+// Rebuild a sensor <select> only when its option list actually changed, and
+// keep the user's pick across the rebuild. This runs from the 5s topic
+// refresh (refreshAllViews -> onVesselChange), and assigning innerHTML
+// discards the <select>'s selection state - so an unconditional rebuild
+// snapped every camera/lidar/overlay dropdown back to its first option
+// (and the views with it) five seconds after the user chose otherwise.
+// Same bug loadSensorConfig() already guards against for the vessel select.
+//
+// Identity is the option label ("Camera 1"), not the value: values are
+// positional indices into `items`, so the same sensor can move to a
+// different index when another one appears or disappears.
+//
+// Returns true when the select's effective selection changed (rebuilt to a
+// different option, or the previous pick vanished), so the caller knows
+// whether the dependent view needs re-subscribing.
 function populateSelect(sel, items, labelFn) {
-  sel.innerHTML = items.length
-    ? items.map((s, i) => `<option value="${i}">${labelFn(s)}</option>`).join('')
-    : '<option value="">None available</option>';
+  const NONE = 'None available';
+  const labels = items.map(labelFn);
+  const rendered = labels.length ? labels : [NONE];
+  const existing = [...sel.options].map((o) => o.textContent);
+  const prevLabel = sel.selectedIndex >= 0 ? sel.options[sel.selectedIndex].textContent : null;
+  if (existing.length === rendered.length && existing.every((l, i) => l === rendered[i])) return false;
+  sel.innerHTML = labels.length
+    ? labels.map((l, i) => `<option value="${i}">${l}</option>`).join('')
+    : `<option value="">${NONE}</option>`;
+  const restored = prevLabel !== null ? labels.indexOf(prevLabel) : -1;
+  if (restored >= 0) sel.selectedIndex = restored;
+  return restored < 0 || restored !== existing.indexOf(prevLabel);
 }
 
 // Refresh every view from one freshly-fetched topic list, isolating each so
@@ -1583,17 +1607,27 @@ function refreshAllViews() {
 }
 
 function onVesselChange() {
+  // Two vessels can expose identically-labelled sensors ("Camera 0"), so a
+  // dropdown that looks unchanged still points at different topics after a
+  // vessel switch - the views must always be rebuilt in that case.
+  const vesselChanged = currentVessel !== $('#vesselSelect').value;
   currentVessel = $('#vesselSelect').value;
   // Note: the Time Histories tab is NOT rebuilt here. It covers every vessel,
   // so the dropdown does not scope it, and rebuilding would throw away the
   // accumulated history of all vessels every time the selection changed.
   // refreshHistoryIfVesselsChanged() owns its lifecycle instead.
   const cams = cameraTopicsForVessel(), lidars = lidarTopicsForVessel();
-  populateSelect($('#cameraSelect'), cams, (s) => `Camera ${s.sensor_id}`);
-  populateSelect($('#lidarSelect'), lidars, (s) => `Lidar ${s.sensor_id}`);
-  populateSelect($('#ovCameraSelect'), cams, (s) => `Camera ${s.sensor_id}`);
-  populateSelect($('#ovLidarSelect'), lidars, (s) => `Lidar ${s.sensor_id}`);
-  onCameraChange(); onLidarChange(); onOverlayChange();
+  const camChanged = populateSelect($('#cameraSelect'), cams, (s) => `Camera ${s.sensor_id}`);
+  const lidarChanged = populateSelect($('#lidarSelect'), lidars, (s) => `Lidar ${s.sensor_id}`);
+  const ovCamChanged = populateSelect($('#ovCameraSelect'), cams, (s) => `Camera ${s.sensor_id}`);
+  const ovLidarChanged = populateSelect($('#ovLidarSelect'), lidars, (s) => `Lidar ${s.sensor_id}`);
+  // Only touch a view whose selection actually moved: each handler
+  // unsubscribes, replaces the <img>/canvas and resets its FPS counter, so
+  // running them on every 5s tick blanked the picture and the stats even
+  // when nothing had changed.
+  if (vesselChanged || camChanged) onCameraChange();
+  if (vesselChanged || lidarChanged) onLidarChange();
+  if (vesselChanged || ovCamChanged || ovLidarChanged) onOverlayChange();
 }
 
 async function loadSensorConfig() {
@@ -1618,7 +1652,10 @@ async function loadSensorConfig() {
       // otherwise sitting on its first option after the rebuild.
       if (currentVessel && vessels.includes(currentVessel)) sel.value = currentVessel;
     }
-    if (!currentVessel || !vessels.includes(currentVessel)) { currentVessel = vessels[0]; sel.value = currentVessel; onVesselChange(); }
+    // Set the <select> only and let onVesselChange() update currentVessel:
+    // it compares the two to know a vessel switch happened, which must force
+    // the views to re-subscribe even when the sensor labels look identical.
+    if (!currentVessel || !vessels.includes(currentVessel)) { sel.value = vessels[0]; onVesselChange(); }
   } catch (e) { console.error('Failed to load sensor config', e); }
 }
 
