@@ -180,7 +180,27 @@ def _run_observer_session(playwright, url, is_running, chromium_args):
     """
     browser = playwright.chromium.launch(headless=True, args=chromium_args)
     try:
-        page = browser.new_page(viewport={"width": 1280, "height": 720})
+        # "local-network-access" is required whenever the frontend is served
+        # from a public origin (e.g. https://mavsim.mavlab.in). Chromium's
+        # Local Network Access checks (enforced by default since ~v142)
+        # refuse any connection from a public page to a loopback address
+        # unless the user grants a permission prompt - and in headless there
+        # is nobody to click "Allow", so every ws://127.0.0.1:<port> to the
+        # sensor bridge failed with net::ERR_BLOCKED_BY_LOCAL_NETWORK_ACCESS_CHECKS
+        # and no camera/lidar data ever left the tab. Pages served from a
+        # local origin (http://localhost:5173, a LAN IP) are exempt, which is
+        # why this only ever showed up against the cloud deployment.
+        #
+        # Granting the permission is deliberately preferred over
+        # `--disable-features=LocalNetworkAccessChecks`: Playwright appends
+        # our args after its own `--disable-features=...` list and Chromium
+        # keeps only the last such flag, so that route would silently drop
+        # every feature Playwright disables for stability.
+        context = browser.new_context(
+            viewport={"width": 1280, "height": 720},
+            permissions=["local-network-access"],
+        )
+        page = context.new_page()
         # Console output is forwarded for diagnostics only - it is no longer
         # the watchdog's liveness signal (see _WATCHDOG_TIMEOUT_SECONDS).
         page.on("console", lambda msg: logger.info(f"[browser console] {msg.type}: {msg.text}"))
