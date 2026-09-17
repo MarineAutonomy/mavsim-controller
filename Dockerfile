@@ -129,6 +129,18 @@ COPY core/vendor/three.min.js /app/static/three.min.js
 COPY teleop/allocation.py .
 COPY teleop/teleop_node.py .
 
+# The ROS2 bridge itself and its web panel. Neither is user code: control
+# happens from the user's own ROS2 node (any language, outside this
+# container) via /<vessel>/actuator_cmd, and bridge_controller.py is the
+# fixed glue that forwards those commands to the simulator. Baked in at
+# the same paths start.sh/start.bat bind-mount them to, so the published
+# image runs on its own (`docker run ... --token`) and a checkout is only
+# needed for the edit-without-rebuild overlay, exactly as for core/ above.
+# The `my_controller.py` name is historical - run_controller.py discovers
+# the bridge under that name (see its docstring).
+COPY bridge_controller.py /app/user_code/my_controller.py
+COPY bridge_webapp.py /app/user_code/bridge_webapp.py
+
 # Expose sensor bridge ports for vessel *
 # 70*1: Camera
 # 70*2: Lidar
@@ -161,10 +173,11 @@ ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/app/sensor_bridge_setup
 
 # Entrypoint: always dispatches to run_controller.py, which auto-discovers
-# the client's controller file (my_controller.py, mounted by start.sh/
-# start.bat) and either runs the CLI/token-mode control loop directly, or -
-# for --mode web - is bypassed entirely in favor of bridge_webapp.py (see
-# start.sh's web-mode docker run, which overrides --entrypoint directly).
+# the bridge (/app/user_code/my_controller.py, baked in above and
+# optionally bind-mounted over by start.sh/start.bat) and either runs the
+# CLI/token-mode control loop directly, or - for --mode web - is bypassed
+# entirely in favor of bridge_webapp.py (see start.sh's web-mode docker
+# run, which overrides --entrypoint directly).
 RUN echo '#!/bin/bash' > /app/entrypoint.sh && \
     echo 'source /opt/ros/humble/setup.bash' >> /app/entrypoint.sh && \
     echo 'source /ros2_ws/install/setup.bash' >> /app/entrypoint.sh && \
@@ -174,7 +187,7 @@ RUN echo '#!/bin/bash' > /app/entrypoint.sh && \
 # Copy test files into container (for running tests)
 COPY core/tests /app/tests
 
-# Default entrypoint: auto-discovers and runs client's my_controller.py
-# Client mounts their code as: -v ./bridge_controller.py:/app/user_code/my_controller.py
+# Default entrypoint: auto-discovers and runs the bridge (my_controller.py).
+# Standalone: docker run ... mavlab/mavsim-controller --token /app/token.json
 # For testing, override entrypoint: docker run --entrypoint="" ... bash -c "..."
 ENTRYPOINT ["/app/entrypoint.sh"]

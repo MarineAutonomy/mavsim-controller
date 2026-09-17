@@ -48,8 +48,9 @@
 #   ./start.sh ABC123 --ros-domain-id 43   # run a second bridge alongside this one
 #
 # By default the image is pulled (mavlab/mavsim-controller:latest) rather
-# than built locally - core/*.py (base_controller.py, observer.py, etc.) are
-# bind-mounted from this checkout on top of it either way, so routine code
+# than built locally - core/*.py (base_controller.py, observer.py, etc.),
+# bridge_controller.py and bridge_webapp.py are bind-mounted from this
+# checkout on top of the image's own copies either way, so routine code
 # changes there take effect on the next run with no rebuild needed. Pass
 # --build (or set BUILD_LOCAL=1) to build the image locally instead, only
 # needed if you've changed the Dockerfile itself (new OS dependency, ROS2/
@@ -295,9 +296,10 @@ if [ "$MODE" = "web" ]; then
         DOCKER_ARGS+=(-p "$WEBAPP_PORT:$WEBAPP_PORT" -p "7001-7095:7001-7095" -p "9090:9090" -p "8899:8899" -p "8900:8900" -p "8901:8901")
     fi
 
-    # The bridge webapp is mounted from this folder and launched via a custom
-    # command, so no image rebuild is needed. run_controller.py (in /app)
-    # discovers the mounted bridge as /app/user_code/my_controller.py.
+    # The bridge webapp is launched via a custom command. It and the bridge
+    # are baked into the image at these same paths; the mounts below overlay
+    # this checkout's copies so edits need no rebuild. run_controller.py (in
+    # /app) discovers the bridge as /app/user_code/my_controller.py.
     WEB_CMD="source /opt/ros/humble/setup.bash \
         && source /ros2_ws/install/setup.bash \
         && cd /app \
