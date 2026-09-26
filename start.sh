@@ -92,6 +92,10 @@ DEFAULT_WEBAPP_PORT=8888
 # are on separate networks there), but always set anyway since this same
 # start.sh is what people use for local testing too.
 DEFAULT_ROS_DOMAIN_ID=42
+
+# Force Fast DDS to use UDPv4 instead of shared memory (SHM)
+FASTDDS_BUILTIN_TRANSPORTS_VAL="UDPv4"
+
 DEFAULT_CMD_TIMEOUT=1.0
 RECORDINGS_DIR="$SCRIPT_DIR/recordings"
 BRIDGE_FILE="$SCRIPT_DIR/bridge_controller.py"
@@ -307,6 +311,8 @@ if [ "$MODE" = "web" ]; then
 
     DOCKER_ARGS+=(
         -e "ROS_DOMAIN_ID=$ROS_DOMAIN_ID_VAL"
+        -e "ROS_LOCALHOST_ONLY=0"
+        -e "FASTDDS_BUILTIN_TRANSPORTS=$FASTDDS_BUILTIN_TRANSPORTS_VAL"
         -v "$RECORDINGS_DIR:/tmp/mavsim_bags"
         -v "$BRIDGE_FILE:/app/user_code/my_controller.py:ro"
         -v "$WEBAPP_FILE:/app/user_code/bridge_webapp.py:ro"
@@ -439,6 +445,8 @@ fi
 
 # Bridge configuration via environment variables.
 DOCKER_ARGS+=(-e "ROS_DOMAIN_ID=$ROS_DOMAIN_ID_VAL")
+DOCKER_ARGS+=(-e "ROS_LOCALHOST_ONLY=0")
+DOCKER_ARGS+=(-e "FASTDDS_BUILTIN_TRANSPORTS=$FASTDDS_BUILTIN_TRANSPORTS_VAL")
 DOCKER_ARGS+=(-e "MAVSIM_CMD_TIMEOUT=$CMD_TIMEOUT")
 [ "$OBSERVE_OTHERS" = true ] && DOCKER_ARGS+=(-e "MAVSIM_OBSERVE_OTHERS=1")
 
