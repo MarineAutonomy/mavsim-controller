@@ -28,7 +28,6 @@ import numpy as np
 
 DOF_ORDER = ('X', 'Y', 'Z', 'K', 'M', 'N')  # surge, sway, heave, roll, pitch, yaw
 
-_EPS_J = 1e-6           # small offset from the singular J=0 point (see _thruster_kt)
 _DEFAULT_RHO = 1000.0   # kg/m^3; not propagated through the handshake, so this is
                         # an engineering default (matches the example vessel yaml's
                         # freshwater density; real seawater is ~1025)
@@ -56,25 +55,55 @@ def _eul_to_rotm(eul_deg):
     ])
 
 
-def _thruster_kt(j_vs_kt):
-    """Return (KT_fwd, KT_rev): thrust coefficient just off either side of J=0.
+def _sorted_table(table):
+    j = np.asarray(table[0], dtype=float)
+    kt = np.asarray(table[1], dtype=float)
+    order = np.argsort(j, kind='stable')
+    return j[order], kt[order]
 
-    J_vs_KT tables in this codebase are allowed to encode a genuine
-    discontinuity/sign-flip at J=0 (e.g. matsya_test.yaml's
-    J_vs_KT=[[-1,0,0,1],[0,-1,1,0]], a duplicate breakpoint at J=0 with two
-    different KT values either side). Querying at literal J=0 (or a signed
-    -0.0/+0.0) does not reliably resolve which side of that duplicate
-    breakpoint np.interp picks - both signs of RPM can numerically land on
-    the same KT. Querying at a real, small +-eps instead lands strictly
-    within each side's own interval, which correctly and stably recovers the
-    intended forward/reverse thrust coefficients.
+
+def _migrate_legacy(j, kt):
+    """Old single-curve tables listed J = 0 twice (e.g. matsya_test.yaml's
+    [[-1,0,0,1],[0,-1,1,0]]); their J < 0 points stood in for reverse running.
+    Keep the J >= 0 branch, using the second value at J = 0 - the same rule as
+    the simulator's thruster_kt.migrate_legacy_table()."""
+    zeros = np.flatnonzero(j == 0.0)
+    if len(zeros) < 2:
+        return j, kt
+    keep = j > 0.0
+    keep[zeros[-1]] = True
+    return j[keep], kt[keep]
+
+
+def _thruster_kt(th):
+    """Return (KT_fwd, KT_rev): bollard (J = 0) thrust coefficients ahead and
+    astern, signed (KT_rev <= 0).
+
+    Follows the simulator's thrust model (ros2_ws/src/mavsim/mavsim/thruster_kt.py):
+    the ahead curve is J_vs_KT; reverse comes from reverse_KT_mode - 'mirror'
+    (the ahead curve negated, the default), 'scaled' (mirror x
+    reverse_KT_percent / 100) or 'table' (its own J_vs_KT_reverse). Tables are
+    read holding their end values.
     """
-    if not j_vs_kt or len(j_vs_kt) != 2 or len(j_vs_kt[0]) == 0:
+    table = th.get('J_vs_KT')
+    if not table or len(table) != 2 or len(table[0]) == 0:
         return 0.0, 0.0
-    j_arr = np.asarray(j_vs_kt[0], dtype=float)
-    kt_arr = np.asarray(j_vs_kt[1], dtype=float)
-    kt_fwd = float(np.interp(_EPS_J, j_arr, kt_arr, left=0.0, right=0.0))
-    kt_rev = float(np.interp(-_EPS_J, j_arr, kt_arr, left=0.0, right=0.0))
+    j, kt = _migrate_legacy(*_sorted_table(table))
+    kt_fwd = max(0.0, float(np.interp(0.0, j, kt)))
+
+    mode = th.get('reverse_KT_mode') or 'mirror'
+    reverse = th.get('J_vs_KT_reverse')
+    if mode == 'table' and reverse and len(reverse) == 2 and len(reverse[0]) > 0:
+        jr, ktr = _sorted_table(reverse)
+        kt_rev = min(0.0, float(np.interp(0.0, jr, ktr)))
+    elif mode == 'scaled':
+        try:
+            scale = float(th.get('reverse_KT_percent')) / 100.0
+        except (TypeError, ValueError):
+            scale = 1.0
+        kt_rev = -scale * kt_fwd
+    else:
+        kt_rev = -kt_fwd
     return kt_fwd, kt_rev
 
 
@@ -99,7 +128,7 @@ class ThrustAllocator:
             diameter = float(th.get('D_prop', 0.1))
             n_max = float(th.get('n_max', 1000.0))
             n_min = float(th.get('n_min', -1000.0))
-            kt_fwd, kt_rev = _thruster_kt(th.get('J_vs_KT'))
+            kt_fwd, kt_rev = _thruster_kt(th)
 
             rotm = _eul_to_rotm(orientation)
             unit_thrust = rotm @ np.array([1.0, 0.0, 0.0])

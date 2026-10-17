@@ -15,7 +15,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from allocation import ThrustAllocator, _eul_to_rotm  # noqa: E402
+from allocation import ThrustAllocator, _eul_to_rotm, _thruster_kt  # noqa: E402
 
 
 # Real single-thruster + rudder geometry from
@@ -159,3 +159,38 @@ class TestEmptyAllocator(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestThrusterKT(unittest.TestCase):
+    """Bollard K_T ahead/astern, following the simulator's ahead + reverse
+    curves (ros2_ws/src/mavsim/mavsim/thruster_kt.py, 2026-10-17)."""
+
+    AHEAD = [[-1, 0, 1], [0.3, 0.15, 0.0]]
+
+    def test_old_single_curve_table_reads_as_before(self):
+        self.assertEqual(_thruster_kt(MATSYA_THRUSTER), (1.0, -1.0))
+
+    def test_mirror_is_the_default(self):
+        self.assertEqual(_thruster_kt({'J_vs_KT': self.AHEAD}), (0.15, -0.15))
+
+    def test_scaled(self):
+        fwd, rev = _thruster_kt({'J_vs_KT': self.AHEAD, 'reverse_KT_mode': 'scaled', 'reverse_KT_percent': 50})
+        self.assertAlmostEqual(fwd, 0.15)
+        self.assertAlmostEqual(rev, -0.075)
+
+    def test_custom_reverse_table(self):
+        fwd, rev = _thruster_kt({'J_vs_KT': self.AHEAD, 'reverse_KT_mode': 'table',
+                                 'J_vs_KT_reverse': [[-1, 0, 1], [-0.2, -0.1, 0.0]]})
+        self.assertAlmostEqual(fwd, 0.15)
+        self.assertAlmostEqual(rev, -0.1)
+
+    def test_weaker_reverse_needs_more_rpm_and_saturates(self):
+        # On the centreline, so the whole surge wrench goes to the one thruster.
+        th = dict(MATSYA_THRUSTER, thruster_location=[-1.4, 0.0, 0.0], J_vs_KT=self.AHEAD,
+                  reverse_KT_mode='scaled', reverse_KT_percent=50)
+        allocator = ThrustAllocator([th], [])
+        self.assertAlmostEqual(allocator.solve([1, 0, 0, 0, 0, 0])['th_01'], th['n_max'], places=4)
+        self.assertAlmostEqual(allocator.solve([-1, 0, 0, 0, 0, 0])['th_01'], th['n_min'], places=4)
+        half = allocator.solve([-0.25, 0, 0, 0, 0, 0])['th_01']
+        mirror = ThrustAllocator([dict(th, reverse_KT_mode='mirror')], []).solve([-0.25, 0, 0, 0, 0, 0])['th_01']
+        self.assertAlmostEqual(half, mirror * np.sqrt(2), places=4)    # half the K_T -> sqrt(2) x the RPM
