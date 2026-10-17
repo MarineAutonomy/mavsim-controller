@@ -37,6 +37,9 @@ import asyncio
 import json
 import logging
 import threading
+import os
+import socket
+import sys
 import time
 from pathlib import Path
 from typing import Dict, Optional
@@ -179,17 +182,10 @@ class TeleopServer:
                 "will compute commands but cannot publish them."
             )
 
-        vessel_configs = _load_vessel_configs(config_file, CONFIG_WAIT_TIMEOUT)
-        self.vessels: Dict[str, VesselTeleop] = {
-            name: VesselTeleop(
-                name,
-                cfg.get("thrusters", []),
-                cfg.get("control_surfaces", []),
-                self.node,
-                self.actuator_cls,
-            )
-            for name, cfg in vessel_configs.items()
-        }
+        self.config_file = config_file
+        self._config_mtime = None
+        self.vessels: Dict[str, VesselTeleop] = {}
+        self._add_vessels(_load_vessel_configs(config_file, CONFIG_WAIT_TIMEOUT))
         if self.vessels:
             logger.info("Teleop ready for vessels: %s", ", ".join(self.vessels))
         else:
@@ -199,17 +195,68 @@ class TeleopServer:
         self.sessions: Dict[str, object] = {}
         self._stop = False
 
+    def _add_vessels(self, vessel_configs: dict):
+        """Create a VesselTeleop for every vessel not seen yet."""
+        for name, cfg in (vessel_configs or {}).items():
+            if name in self.vessels:
+                continue
+            self.vessels[name] = VesselTeleop(
+                name,
+                cfg.get("thrusters", []),
+                cfg.get("control_surfaces", []),
+                self.node,
+                self.actuator_cls,
+            )
+            logger.info("Teleop now drives vessel %s", name)
+        try:
+            self._config_mtime = Path(self.config_file).stat().st_mtime
+        except OSError:
+            pass
+
+    def _reload_config_if_changed(self):
+        """base_controller.py writes one vessel at a time into the config file,
+        and this process may have read it before the later vessels were in it
+        (seen 2026-10-17: started with Mako_01 only, dock_02 written 20 ms
+        later). Pick up vessels added since."""
+        try:
+            mtime = Path(self.config_file).stat().st_mtime
+        except OSError:
+            return
+        if mtime == self._config_mtime:
+            return
+        try:
+            self._add_vessels(json.loads(Path(self.config_file).read_text()))
+        except (json.JSONDecodeError, OSError):
+            pass  # mid-write; try again next time
+
     # ------------------------------------------------------------------
     # Fixed-rate command loop
     # ------------------------------------------------------------------
 
     def run_command_loop(self):
+        """Publish every vessel's command at a fixed rate.
+
+        Errors are logged and the loop carries on: an exception used to end
+        this thread silently, leaving a page that still took keys and sent
+        telemetry while nothing was published any more."""
         period = 1.0 / self.rate
+        last_error = {}
+        next_config_check = 0.0
         while not self._stop:
             start = time.monotonic()
-            for vessel in self.vessels.values():
-                vessel.step(period, self.ramp_seconds)
-                vessel.publish(self.actuator_cls)
+            if start >= next_config_check:
+                next_config_check = start + 1.0
+                self._reload_config_if_changed()
+            for name, vessel in list(self.vessels.items()):
+                try:
+                    vessel.step(period, self.ramp_seconds)
+                    vessel.publish(self.actuator_cls)
+                except Exception as exc:
+                    # Log each distinct error at most every 10 s.
+                    key = (name, type(exc).__name__, str(exc))
+                    if start - last_error.get(key, -1e9) > 10.0:
+                        last_error[key] = start
+                        logger.exception("Teleop command loop error for %s (continuing)", name)
             elapsed = time.monotonic() - start
             time.sleep(max(0.0, period - elapsed))
 
@@ -476,6 +523,41 @@ loadConfig().then(connect);
 """
 
 
+def _busy_ports(*ports: int) -> list:
+    """Return the ports from `ports` that cannot be bound right now."""
+    busy = []
+    for port in ports:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            probe.bind(("0.0.0.0", port))
+        except OSError:
+            busy.append(port)
+        finally:
+            probe.close()
+    return busy
+
+
+def _exit_with_parent(poll_seconds: float = 1.0):
+    """Exit when the controller that launched us is gone.
+
+    base_controller.py starts this node in its own session, so stopping the
+    bridge (which kills the controller's process group) does not reach it;
+    it used to live on as an orphan holding ports 8900/8901, so the next
+    session's teleop failed with "Address already in use" while the browser
+    page kept talking to the orphan."""
+    parent = os.getppid()
+
+    def watch():
+        while True:
+            time.sleep(poll_seconds)
+            if os.getppid() != parent:
+                logger.warning("Controller (pid %d) has exited; stopping teleop", parent)
+                os._exit(0)
+
+    threading.Thread(target=watch, daemon=True, name="parent-watch").start()
+
+
 def main():
     parser = argparse.ArgumentParser(description="mavsim Keyboard Teleop Node")
     parser.add_argument("--http-port", type=int, default=8900, help="Teleop page port (default: 8900)")
@@ -486,6 +568,14 @@ def main():
     parser.add_argument("--ramp-seconds", type=float, default=0.5,
                          help="Seconds to ramp a DOF from 0 to +-1 while a key is held (default: 0.5)")
     args = parser.parse_args()
+
+    # Refuse to start half-working: with the ports taken by another teleop,
+    # the browser would talk to that one instead of this one.
+    busy = _busy_ports(args.http_port, args.ws_port)
+    if busy:
+        logger.error("Teleop ports %s are already in use (another teleop still running?); not starting", busy)
+        sys.exit(3)
+    _exit_with_parent()
 
     server = TeleopServer(args.config_file, rate=args.rate, ramp_seconds=args.ramp_seconds)
 
