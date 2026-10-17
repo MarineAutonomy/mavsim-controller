@@ -9,7 +9,7 @@ ports and broke the next session's teleop. Helpers are now recorded by pid +
 kernel start time, and kill_registered_children() - in base_controller and
 its twin in bridge_webapp - stops whatever survived. Both twins are tested.
 
-    python3 -m pytest core/tests/test_child_registry.py
+    python3 -m pytest core/tests/unit/test_child_registry.py
 """
 
 import json
@@ -20,7 +20,7 @@ import tempfile
 import time
 import unittest
 
-ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
 sys.path.insert(0, os.path.join(ROOT, 'core'))
 sys.path.insert(0, ROOT)
 
