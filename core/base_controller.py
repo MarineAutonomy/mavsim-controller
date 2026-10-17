@@ -11,6 +11,7 @@ License: MIT
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import re
@@ -29,6 +30,83 @@ except ImportError:
     LocalSensorGenerator = None
 
 logger = logging.getLogger(__name__)
+
+# Helper processes (observer, rosbridge, visualizer, teleop) are recorded here
+# by pid + kernel start time, so whatever outlives this controller can be
+# cleaned up later: each is started in its own session, so killing this
+# controller's process group never reaches them, and close() only stops them
+# if it gets to run (bridge_webapp's 8 s stop limit can cut it short). Seen
+# 2026-10-17: an orphaned teleop held ports 8900/8901, the next session's
+# teleop failed with "Address already in use", and the browser kept talking
+# to the orphan, whose command loop had stopped. bridge_webapp.py has a twin
+# of kill_registered_children(); keep the two in step.
+CHILD_REGISTRY_FILE = "/tmp/mavsim_bridge_state/child_processes.json"
+
+
+def _proc_start_time(pid):
+    """Kernel start time of a live (non-zombie) process, else None. Comparing
+    it with the recorded value guards against killing a reused pid."""
+    try:
+        with open(f"/proc/{int(pid)}/stat") as f:
+            fields = f.read().rsplit(")", 1)[1].split()
+    except (OSError, ValueError, IndexError, TypeError):
+        return None
+    if not fields or fields[0] == "Z":
+        return None
+    return fields[19] if len(fields) > 19 else None   # stat field 22: starttime
+
+
+def _read_child_registry() -> dict:
+    try:
+        with open(CHILD_REGISTRY_FILE) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def register_child_process(label: str, proc) -> None:
+    start = _proc_start_time(proc.pid)
+    if start is None:
+        return
+    registry = _read_child_registry()
+    registry[label] = {"pid": proc.pid, "start": start}
+    try:
+        os.makedirs(os.path.dirname(CHILD_REGISTRY_FILE), exist_ok=True)
+        tmp = CHILD_REGISTRY_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(registry, f)
+        os.replace(tmp, CHILD_REGISTRY_FILE)
+    except OSError as e:
+        logger.debug(f"Could not record {label} pid: {e}")
+
+
+def kill_registered_children(timeout: float = 3.0) -> list:
+    """SIGTERM, then SIGKILL, the process group of every recorded helper that
+    is still the same process; forget the registry. Returns the labels killed."""
+    alive = {label: e for label, e in _read_child_registry().items()
+             if isinstance(e, dict) and e.get("start") is not None
+             and _proc_start_time(e.get("pid")) == e.get("start")}
+    for e in alive.values():
+        try:
+            os.killpg(os.getpgid(e["pid"]), signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline and any(
+            _proc_start_time(e["pid"]) == e["start"] for e in alive.values()):
+        time.sleep(0.1)
+    for e in alive.values():
+        if _proc_start_time(e["pid"]) == e["start"]:
+            try:
+                os.killpg(os.getpgid(e["pid"]), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+    try:
+        os.remove(CHILD_REGISTRY_FILE)
+    except OSError:
+        pass
+    return list(alive)
 
 
 SENSOR_BRIDGE_BASE_PORT = 7000
@@ -123,6 +201,13 @@ class BaseController:
         # interfaces/Actuator commands on /<vessel>/actuator_cmd from
         # browser keypresses, launched once per session the same way.
         self._teleop_process: Optional[subprocess.Popen] = None
+
+        # A previous controller in this container may have left helpers
+        # running (see CHILD_REGISTRY_FILE); they would hold the ports these
+        # need, so stop them before launching new ones.
+        leftovers = kill_registered_children()
+        if leftovers:
+            logger.warning(f"Stopped helper processes left over from a previous run: {', '.join(leftovers)}")
 
         # Multi-vessel mode: list of vessel ros_names from token
         self._token_vessels = token.get('vessels', []) if token else []
@@ -1332,6 +1417,7 @@ class BaseController:
                 f"--namespace={namespace or ''}",
                 f"--frontend-url={self.frontend_url}",
             ], start_new_session=True)
+            register_child_process("observer", self._observer_process)
             logger.info(f"Launched headless sensor observer (pid={self._observer_process.pid})")
         except Exception as e:
             # Best-effort: a failed observer launch must not break the actual
@@ -1391,6 +1477,7 @@ class BaseController:
                 "ros2", "launch", "rosbridge_server", "rosbridge_websocket_launch.xml",
                 f"port:={self.rosbridge_port}",
             ], start_new_session=True)
+            register_child_process("rosbridge", self._rosbridge_process)
             logger.info(f"Launched rosbridge websocket (+ rosapi) on port {self.rosbridge_port} "
                         f"(pid={self._rosbridge_process.pid})")
         except Exception as e:
@@ -1406,6 +1493,7 @@ class BaseController:
                 "--port", str(self.visualizer_port),
                 "--rosbridge-port", str(self.rosbridge_port),
             ], start_new_session=True)
+            register_child_process("visualizer", self._visualizer_process)
             logger.info(f"Launched ROS2 topic visualizer on port {self.visualizer_port} "
                         f"(pid={self._visualizer_process.pid})")
         except Exception as e:
@@ -1442,6 +1530,7 @@ class BaseController:
                 "--http-port", str(self.teleop_http_port),
                 "--ws-port", str(self.teleop_ws_port),
             ], start_new_session=True)
+            register_child_process("teleop", self._teleop_process)
             logger.info(f"Launched keyboard teleop on port {self.teleop_http_port} "
                         f"(ws {self.teleop_ws_port}, pid={self._teleop_process.pid})")
         except Exception as e:
@@ -1622,6 +1711,9 @@ class BaseController:
                 except Exception as e:
                     logger.debug(f"Error stopping {label}: {e}")
                 setattr(self, attr, None)
+        # Anything still recorded survived the stop above; finish it and
+        # forget the registry so the next run starts clean.
+        kill_registered_children(timeout=2.0)
 
         # Zero all actuators before disconnecting so the vessel doesn't
         # keep running with the last commanded thrust/rudder.

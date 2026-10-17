@@ -48,6 +48,58 @@ logger = logging.getLogger("bridge_webapp")
 app = Flask(__name__)
 
 
+# Twin of base_controller.kill_registered_children() (kept separate so this
+# web app doesn't import the ROS-heavy controller module); keep them in step.
+# The controller records each helper it launches (observer, rosbridge,
+# visualizer, teleop) here. They run in their own sessions, so killing the
+# controller's process group in stop() doesn't reach them, and if the
+# controller is killed before its close() finishes they are orphaned - e.g.
+# a teleop holding ports 8900/8901 so the next session's teleop cannot start.
+CHILD_REGISTRY_FILE = "/tmp/mavsim_bridge_state/child_processes.json"
+
+
+def _proc_start_time(pid):
+    try:
+        with open(f"/proc/{int(pid)}/stat") as f:
+            fields = f.read().rsplit(")", 1)[1].split()
+    except (OSError, ValueError, IndexError, TypeError):
+        return None
+    if not fields or fields[0] == "Z":
+        return None
+    return fields[19] if len(fields) > 19 else None
+
+
+def kill_registered_children(timeout: float = 3.0) -> list:
+    try:
+        with open(CHILD_REGISTRY_FILE) as f:
+            registry = json.load(f)
+    except (OSError, ValueError):
+        return []
+    alive = {label: e for label, e in (registry if isinstance(registry, dict) else {}).items()
+             if isinstance(e, dict) and e.get("start") is not None
+             and _proc_start_time(e.get("pid")) == e.get("start")}
+    for e in alive.values():
+        try:
+            os.killpg(os.getpgid(e["pid"]), signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline and any(
+            _proc_start_time(e["pid"]) == e["start"] for e in alive.values()):
+        time.sleep(0.1)
+    for e in alive.values():
+        if _proc_start_time(e["pid"]) == e["start"]:
+            try:
+                os.killpg(os.getpgid(e["pid"]), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+    try:
+        os.remove(CHILD_REGISTRY_FILE)
+    except OSError:
+        pass
+    return list(alive)
+
+
 class BridgeState:
     """Tracks the running bridge subprocess and its log output."""
 
@@ -124,6 +176,9 @@ class BridgeState:
                 except (ProcessLookupError, PermissionError) as e:
                     logger.debug("Error killing bridge process group: %s", e)
                 self.process.wait()
+            leftovers = kill_registered_children()
+            if leftovers:
+                logger.warning("Stopped helper processes the controller left running: %s", ", ".join(leftovers))
             self.running = False
             self._cleanup_frames()
             return True
