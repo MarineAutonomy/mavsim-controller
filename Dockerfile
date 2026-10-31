@@ -116,9 +116,10 @@ COPY core/observer.py .
 # both launched as subprocesses of base_controller.py in every mode
 # (CLI/web/token), so a browser can inspect the local ROS2 topics (time
 # histories, camera, point cloud, camera+lidar overlay) even when the user
-# only has SSH/browser access and no rviz2/X11.
+# only has SSH/browser access and no rviz2/X11. core/vendor holds its
+# browser libraries: three.js, and xterm.js for the opt-in Terminal tab.
 COPY core/visualizer_server.py .
-COPY core/vendor/three.min.js /app/static/three.min.js
+COPY core/vendor/ /app/static/
 
 # Keyboard teleop (plans/plan_teleop.md): an rclpy node that publishes
 # interfaces/Actuator commands on /<vessel>/actuator_cmd from browser
