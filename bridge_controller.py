@@ -165,6 +165,17 @@ class MyController(BaseController):
             self._cmd_subs[vname] = sub
             logger.info("Bridge listening for commands on %s (owned vessel)", topic)
 
+        # /sim_reset (std_msgs/Empty): reset the simulation to t = 0. The
+        # simulator's confirmation comes back as /sim_reset_event (published
+        # by BaseController). reset_simulation() blocks until then, so it runs
+        # off the spin thread to keep actuator_cmd flowing.
+        from std_msgs.msg import Empty
+        self._bridge_node.create_subscription(
+            Empty, "/sim_reset",
+            lambda _msg: threading.Thread(target=self.reset_simulation, daemon=True).start(), 10
+        )
+        logger.info("Bridge listening for reset requests on /sim_reset")
+
         if self._observe_others:
             self._setup_observe_publishers()
 
@@ -220,6 +231,12 @@ class MyController(BaseController):
                 }
 
         return _callback
+
+    def on_reset(self, reset_count):
+        # The stored commands were for the previous run: forward nothing until
+        # the user's node answers the new run's first state.
+        with self._cmd_lock:
+            self._latest_cmd.clear()
 
     # ------------------------------------------------------------------
     # Command forwarding (bridge -> simulator via REST)

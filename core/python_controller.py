@@ -448,6 +448,36 @@ class MavsimAPIClient:
             logger.error(f"Control command failed: {e}")
             return False
     
+    def reset_simulation(self) -> bool:
+        """
+        Ask the simulation to go back to its initial conditions at t = 0.
+
+        Every vessel returns to the initial conditions in the configuration
+        and the waves restart with the same phase; the session, this
+        connection and the session's time limit carry on. The simulator
+        then publishes sim_reset_event.
+
+        Returns:
+            True if the simulation accepted the reset
+        """
+        try:
+            response = requests.post(
+                f"{self._control_url}/reset",
+                json={'sessionId': self.session_id, 'apiToken': self.api_token},
+                timeout=max(self.timeout, 10)
+            )
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Reset failed: {e}")
+            return False
+        if response.status_code != 200:
+            try:
+                error = response.json().get('message') or response.json().get('error')
+            except ValueError:
+                error = response.text
+            logger.error(f"Reset failed: {response.status_code} - {error}")
+            return False
+        return True
+
     def report_recording_status(
         self,
         status: str,
@@ -658,6 +688,7 @@ class RoslibSubscriber:
         # from vessel motion alone.
         self._raw_vessel_state_times: Dict[str, float] = {}
         self._vessel_state_der_topics: list = []
+        self._reset_event_topic = None
         self._state_der_callbacks: List[Callable] = []
         
         logger.info(f"Roslib subscriber initialized: {self.rosbridge_url}")
@@ -981,6 +1012,38 @@ class RoslibSubscriber:
     def add_state_der_callback(self, callback: Callable):
         """Register a callback(ros_name, data_list) for vessel_state_der updates."""
         self._state_der_callbacks.append(callback)
+
+    def subscribe_reset_event(self, callback: Callable[[int], None]) -> bool:
+        """Subscribe to the session's sim_reset_event (std_msgs/UInt32: the
+        number of resets so far, published once per reset to t = 0)."""
+        if not self._connected or self._ros is None:
+            logger.error("Not connected to rosbridge")
+            return False
+        try:
+            import roslibpy
+        except ImportError:
+            logger.error("roslibpy not installed")
+            return False
+
+        clean_ns = re.sub(r'^/+|/+$', '', self.namespace) if self.namespace else ''
+        topic = f"/{clean_ns}/sim_reset_event" if clean_ns else "/sim_reset_event"
+        try:
+            self._reset_event_topic = roslibpy.Topic(self._ros, topic, 'std_msgs/UInt32')
+            self._reset_event_topic.subscribe(lambda msg: callback(int(msg.get('data', 0))))
+            logger.info(f"Subscribed to reset events: {topic}")
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to subscribe to {topic}: {e}")
+            return False
+
+    def clear_vessel_states(self):
+        """Forget the latest states, e.g. after a reset, so nothing acts on
+        the previous run's state until the next message arrives."""
+        with self._vessel_state_lock:
+            self._vessel_states.clear()
+            self._raw_vessel_states.clear()
+            self._raw_vessel_state_ders.clear()
+            self._raw_vessel_state_times.clear()
 
     def get_raw_state(self, ros_name: str) -> Optional[np.ndarray]:
         """Return the latest raw state array (no timestamp) for a vessel."""
@@ -1475,6 +1538,18 @@ class MavsimController:
             True if successful
         """
         return self.api_client.send_command(actuator_names, actuator_values)
+
+    def reset_simulation(self) -> bool:
+        """Ask the simulation to go back to its initial conditions at t = 0."""
+        return self.api_client.reset_simulation()
+
+    def subscribe_reset_event(self, callback: Callable[[int], None]) -> bool:
+        """Call callback(reset_count) on every reset of the simulation."""
+        return self.subscriber.subscribe_reset_event(callback)
+
+    def clear_vessel_states(self):
+        """Forget the latest vessel states (see RoslibSubscriber)."""
+        self.subscriber.clear_vessel_states()
     
     def get_odometry(self) -> Optional[Odometry]:
         """Get latest odometry."""
