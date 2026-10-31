@@ -127,11 +127,16 @@ def _ned_to_llh(ned: np.ndarray, llh0: np.ndarray) -> np.ndarray:
     rp = 6356752.314245
     e = np.sqrt(1 - (rp / re) ** 2)
 
+    # Prime vertical (R_N) and meridian (R_M) radii of curvature (Fossen 2011,
+    # §2.4.4): latitude moves along the meridian, longitude along the parallel
+    # of radius R_N cos(mu0). Until 2026-10-31 these were swapped and R_M
+    # lacked its 3/2 power: about 0.65 % of the distance from the datum.
+    # Same as the simulator's module_kinematics.ned_to_llh.
     RN = re / np.sqrt(1 - (e * np.sin(mu0)) ** 2)
-    RM = re * (1 - e ** 2) / (1 - (e * np.sin(mu0)) ** 2)
+    RM = re * (1 - e ** 2) / (1 - (e * np.sin(mu0)) ** 2) ** 1.5
 
-    dmu = xn * np.arctan2(1, RN)
-    dl = yn * np.arctan2(1, RM * np.cos(mu0))
+    dmu = xn * np.arctan2(1, RM)
+    dl = yn * np.arctan2(1, RN * np.cos(mu0))
 
     mu = _ssa(mu0 + dmu) * 180 / np.pi
     lon = _ssa(l0 + dl) * 180 / np.pi
