@@ -34,9 +34,15 @@
 #   ./start.sh
 #   ./start.sh <controller-code> [--vessel-name NAME] [--backend-url URL]
 #              [--frontend-url URL] [--rate HZ] [--ros-domain-id N]
-#              [--cmd-timeout SEC] [--observe-others]
+#              [--cmd-timeout SEC] [--observe-others] [--enable-terminal]
 #   ./start.sh --token /path/to/token.json [options...]
 #   ./start.sh --mode web [--port 8888] [--backend-url URL] [--frontend-url URL] [--ros-domain-id N]
+#              [--enable-terminal]
+#
+# --enable-terminal adds a Terminal tab to the visualizer (port 8899): a bash
+# shell inside the container, e.g. for `ros2 topic pub` by hand. It has no
+# login, so anyone who can reach port 8899 gets a root shell; use it on a
+# trusted network only.
 #
 # Examples:
 #   ./start.sh                      # web mode, no controller-code/token needed upfront
@@ -112,6 +118,9 @@ CORE_FILES=(base_controller.py python_controller.py run_controller.py \
 # CORE_FILES above, but from its own teleop/ folder.
 TELEOP_DIR="$SCRIPT_DIR/teleop"
 TELEOP_FILES=(allocation.py teleop_node.py)
+# The visualizer's browser libraries (three.js, xterm.js), mounted over the
+# image's /app/static for the same reason.
+VENDOR_DIR="$CORE_DIR/vendor"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -161,6 +170,7 @@ else
 fi
 WEBAPP_PORT="$DEFAULT_WEBAPP_PORT"
 ROS_DOMAIN_ID_VAL="$DEFAULT_ROS_DOMAIN_ID"
+ENABLE_TERMINAL=false
 
 if [ $# -ge 1 ] && [ "$1" = "--mode" ]; then
     [ $# -lt 2 ] && { print_error "--mode requires a value: web or cli"; exit 1; }
@@ -259,6 +269,7 @@ if [ "$MODE" = "web" ]; then
             --backend-url)   BACKEND_URL="$2"; shift 2 ;;
             --frontend-url)  FRONTEND_URL="$2"; shift 2 ;;
             --ros-domain-id) ROS_DOMAIN_ID_VAL="$2"; shift 2 ;;
+            --enable-terminal) ENABLE_TERMINAL=true; shift ;;
             *)               print_warn "Unknown argument: $1 (ignored)"; shift ;;
         esac
     done
@@ -284,6 +295,8 @@ if [ "$MODE" = "web" ]; then
     print_info "  Recordings:    $RECORDINGS_DIR"
     print_info "  Visualizer:    http://localhost:8899 (time histories, camera, point cloud, overlay)"
     print_info "  Teleop:        http://localhost:8900 (keyboard control)"
+    [ "$ENABLE_TERMINAL" = true ] && \
+        print_warn "  Terminal:      ENABLED in the visualizer - a root shell for anyone who can reach port 8899"
     if [ "$GPU_AVAILABLE" = true ]; then
         print_info "  GPU:           NVIDIA GPU detected - passing through for hardware-accelerated rendering"
     else
@@ -316,7 +329,9 @@ if [ "$MODE" = "web" ]; then
         -v "$RECORDINGS_DIR:/tmp/mavsim_bags"
         -v "$BRIDGE_FILE:/app/user_code/my_controller.py:ro"
         -v "$WEBAPP_FILE:/app/user_code/bridge_webapp.py:ro"
+        -v "$VENDOR_DIR:/app/static:ro"
     )
+    [ "$ENABLE_TERMINAL" = true ] && DOCKER_ARGS+=(-e "MAVSIM_ENABLE_TERMINAL=1")
     for f in "${CORE_FILES[@]}"; do
         DOCKER_ARGS+=(-v "$CORE_DIR/$f:/app/$f:ro")
     done
@@ -356,9 +371,9 @@ if [ -z "$TOKEN_FILE" ] && [ $# -lt 1 ]; then
     print_error "(tip: run $0 with no arguments at all for web mode instead)"
     echo ""
     echo "Usage:"
-    echo "  $0 <controller-code> [--vessel-name NAME] [--backend-url URL] [--frontend-url URL] [--rate HZ] [--ros-domain-id N] [--cmd-timeout SEC] [--observe-others]"
+    echo "  $0 <controller-code> [--vessel-name NAME] [--backend-url URL] [--frontend-url URL] [--rate HZ] [--ros-domain-id N] [--cmd-timeout SEC] [--observe-others] [--enable-terminal]"
     echo "  $0 --token /path/to/token.json [options...]"
-    echo "  $0 --mode web [--port 8888] [--backend-url URL] [--frontend-url URL] [--ros-domain-id N]"
+    echo "  $0 --mode web [--port 8888] [--backend-url URL] [--frontend-url URL] [--ros-domain-id N] [--enable-terminal]"
     echo ""
     echo "Examples:"
     echo "  $0 ABC123"
@@ -393,6 +408,7 @@ while [[ $# -gt 0 ]]; do
         --ros-domain-id)   ROS_DOMAIN_ID_VAL="$2"; shift 2 ;;
         --cmd-timeout)     CMD_TIMEOUT="$2"; shift 2 ;;
         --observe-others)  OBSERVE_OTHERS=true; shift ;;
+        --enable-terminal) ENABLE_TERMINAL=true; shift ;;
         *)                 PYTHON_ARGS+=("$1"); shift ;;
     esac
 done
@@ -429,6 +445,8 @@ else
     print_info "  GPU:          none detected - observer uses CPU-only SwiftShader rendering"
 fi
 [ "$OBSERVE_OTHERS" = true ] && print_info "  Observe-others: enabled (read-only telemetry for non-owned vessels)"
+[ "$ENABLE_TERMINAL" = true ] && \
+    print_warn "  Terminal:     ENABLED in the visualizer - a root shell for anyone who can reach port 8899"
 echo ""
 
 DOCKER_ARGS=(docker run --rm --name "$CONTAINER_NAME")
@@ -449,10 +467,12 @@ DOCKER_ARGS+=(-e "ROS_LOCALHOST_ONLY=0")
 DOCKER_ARGS+=(-e "FASTDDS_BUILTIN_TRANSPORTS=$FASTDDS_BUILTIN_TRANSPORTS_VAL")
 DOCKER_ARGS+=(-e "MAVSIM_CMD_TIMEOUT=$CMD_TIMEOUT")
 [ "$OBSERVE_OTHERS" = true ] && DOCKER_ARGS+=(-e "MAVSIM_OBSERVE_OTHERS=1")
+[ "$ENABLE_TERMINAL" = true ] && DOCKER_ARGS+=(-e "MAVSIM_ENABLE_TERMINAL=1")
 
 DOCKER_ARGS+=(
     -v "$RECORDINGS_DIR:/tmp/mavsim_bags"
     -v "$BRIDGE_FILE:/app/user_code/my_controller.py:ro"
+    -v "$VENDOR_DIR:/app/static:ro"
 )
 for f in "${CORE_FILES[@]}"; do
     DOCKER_ARGS+=(-v "$CORE_DIR/$f:/app/$f:ro")

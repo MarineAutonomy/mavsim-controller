@@ -224,6 +224,13 @@ class BaseController:
         self._running = False
         self._control_thread: Optional[threading.Thread] = None
         self._control_rate_hz = 10.0
+
+        # Mid-session resets (sim_reset_event): the last count the simulator
+        # announced, and the last one the control loop has acted on.
+        self._reset_count = 0
+        self._reset_handled = 0
+        self._reset_cond = threading.Condition()
+        self._reset_event_pub = None   # local /sim_reset_event, see _setup_local_republishers
         
         # Local sensor generators (per vessel) for client-side IMU/GPS/DVL/Encoder/WaveProbe
         self._sensor_generators: Dict[str, 'LocalSensorGenerator'] = {}
@@ -315,6 +322,10 @@ class BaseController:
                     logger.warning(f"Failed to subscribe vessel states for {vname}")
                 if not ctrl.subscribe_vessel_state_ders():
                     logger.warning(f"Failed to subscribe vessel state ders for {vname}")
+
+            # Resets are session-wide: one subscription, on the primary.
+            if self._controller is not None and not self._controller.subscribe_reset_event(self._on_reset_event):
+                logger.warning("Failed to subscribe to reset events")
 
             # Set up local sensor generators for each controlled vessel
             self._setup_local_sensors()
@@ -604,6 +615,11 @@ class BaseController:
 
             logger.info(f"Local ROS2 publishers created for {vname}: "
                         f"{state_topic}, {state_der_topic}, {odom_topic}")
+
+        # Session-wide: one message per reset to t = 0 (the count so far), for
+        # ROS 2 controllers behind the bridge, and in bags to split the trials.
+        from std_msgs.msg import UInt32
+        self._reset_event_pub = self._ros2_node.create_publisher(UInt32, '/sim_reset_event', 10)
 
     def _republish_to_local_ros2(self):
         """Republish rosbridge data and generate odometry on local ROS2 topics."""
@@ -1092,6 +1108,9 @@ class BaseController:
         
         while self._running:
             try:
+                if self._reset_count != self._reset_handled:
+                    self._handle_reset()
+
                 # Feed latest state into local sensor generators
                 if self._sensor_generators:
                     self._update_sensor_states()
@@ -1121,6 +1140,12 @@ class BaseController:
                     continue
                 
                 result = self.control_loop(vessel_states)
+
+                # control_loop() reset the simulation itself (a trial ended):
+                # its commands were for the run that just ended.
+                if self._reset_count != self._reset_handled:
+                    self._handle_reset()
+                    result = None
 
                 if result:
                     self._dispatch_commands(result)
@@ -1218,6 +1243,70 @@ class BaseController:
         # Default: do nothing
         return {}
     
+    def reset_simulation(self, timeout: float = 5.0) -> bool:
+        """
+        Reset the simulation to its initial conditions at t = 0.
+
+        Every vessel returns to the initial conditions in its configuration
+        and the waves restart with the same phase, while the session, the
+        connection and the session's time limit carry on: run trial after
+        trial (e.g. PID gains) without starting a new session.
+
+        Blocks until the simulator confirms the reset. on_reset() then runs
+        on the control thread before control_loop() sees a state from the
+        new run; if this is called from inside control_loop(), the commands
+        that call returns are dropped.
+
+        Returns:
+            True once the simulator has reset
+        """
+        if self._controller is None:
+            logger.error("Cannot reset: not connected")
+            return False
+        with self._reset_cond:
+            before = self._reset_count
+        if not self._controller.reset_simulation():
+            return False
+        with self._reset_cond:
+            if not self._reset_cond.wait_for(lambda: self._reset_count > before, timeout):
+                logger.warning(f"No reset confirmation from the simulator within {timeout:.0f} s")
+                return False
+        logger.info(f"Simulation reset to t = 0 (reset #{self._reset_count})")
+        return True
+
+    def on_reset(self, reset_count: int):
+        """
+        Called after every reset of the simulation to t = 0, whether this
+        controller asked for it or the dashboard's Reset button did.
+
+        Override to clear the controller's own state from the previous run:
+        integrators, previous errors, filters, trial logs. Runs on the
+        control thread, before control_loop() sees the new run.
+
+        Args:
+            reset_count: Number of resets in this session so far
+        """
+        pass
+
+    def _on_reset_event(self, reset_count: int):
+        """rosbridge thread: the simulator announced a reset."""
+        with self._reset_cond:
+            self._reset_count = max(self._reset_count, reset_count)
+            self._reset_cond.notify_all()
+
+    def _handle_reset(self):
+        """Control thread: drop the previous run's states, then on_reset()."""
+        self._reset_handled = self._reset_count
+        for ctrl in self._all_clients():
+            ctrl.clear_vessel_states()
+        if self._reset_event_pub is not None:
+            from std_msgs.msg import UInt32
+            self._reset_event_pub.publish(UInt32(data=self._reset_handled))
+        try:
+            self.on_reset(self._reset_handled)
+        except Exception as e:
+            logger.error(f"on_reset error: {e}", exc_info=True)
+
     def on_camera(self, vessel_id: int, camera_id: int):
         """
         Decorator to register camera frame callback.

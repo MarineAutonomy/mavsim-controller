@@ -88,5 +88,17 @@ Optional web-mode flags:
 | `--backend-url` | `http://localhost:5000` | MAVSim backend URL |
 | `--frontend-url` | `http://localhost:5173` | MAVSim frontend URL (needed for camera/lidar rendering) |
 | `--ros-domain-id` | `42` | ROS 2 domain ID for the bridge |
+| `--enable-terminal` | off | Adds a **Terminal** tab to the visualizer (see below) |
 
 Recordings are written to `./recordings/`. A local visualizer is available at http://localhost:8899 and keyboard teleop at http://localhost:8900.
+
+### Terminal in the visualizer
+
+With `--enable-terminal` (in any mode, or `-e MAVSIM_ENABLE_TERMINAL=1` on a hand-written `docker run`), the visualizer gets a **Terminal** tab: a bash shell inside the bridge container, with ROS 2 sourced and the bridge's `ROS_DOMAIN_ID` set. Use it to test by hand, for example to reset the simulation or watch a topic:
+
+```bash
+ros2 topic pub --once -w 1 /sim_reset std_msgs/msg/Empty
+ros2 topic echo /sim_reset_event
+```
+
+The terminal has no login: **anyone who can reach port 8899 gets a root shell in the container**, and on Linux the container shares the host's network. Turn it on only on a trusted network. Closing the tab ends its shell.

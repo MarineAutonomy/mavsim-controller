@@ -21,14 +21,31 @@ projection math. That snapshot is written by BaseController right after
 handshake (`_fetch_and_cache_sensor_config`) to STATE_DIR, following the same
 shared-/tmp-directory pattern already used for camera preview frames
 (CAMERA_FRAME_DIR in bridge_controller.py / bridge_webapp.py).
+
+With --enable-terminal (or MAVSIM_ENABLE_TERMINAL=1) the page also gets a
+Terminal tab: an interactive bash shell in this container, for testing by
+hand (`ros2 topic pub ...`). It is off by default because there is no login:
+anyone who can reach this port gets a root shell.
 """
 
 import argparse
+import codecs
+import fcntl
 import json
 import logging
+import os
+import pty
+import select
+import signal
+import struct
+import sys
+import termios
+import threading
+import time
+import uuid
 from pathlib import Path
 
-from flask import Flask, Response, jsonify, send_from_directory
+from flask import Flask, Response, jsonify, request, send_from_directory
 
 STATE_DIR = Path("/tmp/mavsim_bridge_state")
 SENSOR_CONFIG_FILE = STATE_DIR / "sensor_config.json"
@@ -48,12 +65,14 @@ logger = logging.getLogger("visualizer_server")
 app = Flask(__name__, static_folder=None)
 
 _rosbridge_port = 9090
+_terminal_enabled = False
 
 
 @app.route("/")
 def index():
     return Response(
-        _PAGE_HTML.replace("__ROSBRIDGE_PORT__", str(_rosbridge_port)),
+        _PAGE_HTML.replace("__ROSBRIDGE_PORT__", str(_rosbridge_port))
+                  .replace("__TERMINAL_ENABLED__", "true" if _terminal_enabled else "false"),
         content_type="text/html",
     )
 
@@ -72,6 +91,224 @@ def sensor_config():
     except (json.JSONDecodeError, OSError) as e:
         logger.warning("Failed to read sensor config snapshot: %s", e)
         return jsonify({}), 200
+
+
+# ---------------------------------------------------------------------------
+# Browser terminal (--enable-terminal). Each Terminal tab owns one bash on a
+# pseudo-terminal. Output goes to the browser as Server-Sent Events and
+# keystrokes come back as POSTs: plain HTTP on this server's own port, so
+# start.sh has no extra port to publish and no WebSocket library is needed.
+# ---------------------------------------------------------------------------
+TERMINAL_MAX_SESSIONS = 4
+# A closed tab is only noticed when a write to its stream fails, so the
+# stream writes at least this often; the shell outlives its tab by at most
+# this long.
+TERMINAL_KEEPALIVE_S = 15.0
+
+_terminals = {}  # id -> TerminalSession
+_terminals_lock = threading.Lock()
+
+
+class TerminalSession:
+    """An interactive bash on a pseudo-terminal."""
+
+    def __init__(self, cols=80, rows=24):
+        # Built before the fork: the child of a threaded process should only
+        # exec. `bash -i` reads /root/.bashrc, which sources ROS 2 and the
+        # interfaces workspace (Dockerfile); ROS_DOMAIN_ID comes through the
+        # environment, so `ros2 topic ...` sees the bridge's local topics.
+        env = dict(os.environ, TERM="xterm-256color")
+        cwd = "/app" if os.path.isdir("/app") else os.getcwd()
+        pid, fd = pty.fork()
+        if pid == 0:
+            try:
+                os.chdir(cwd)
+                os.execvpe("bash", ["bash", "-i"], env)
+            finally:
+                os._exit(127)
+        self.pid = pid
+        self.fd = fd
+        self.closed = False
+        # Once a stream is attached, only its thread closes the fd, so that a
+        # recycled fd number can never be selected on by mistake.
+        self.attached = False
+        self._fd_open = True
+        self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        self.resize(cols, rows)
+
+    def read(self, timeout):
+        """Output since the last call ('' if none came within timeout), or None once the shell has exited."""
+        if not self._fd_open:
+            return None
+        try:
+            ready, _, _ = select.select([self.fd], [], [], timeout)
+            if not ready:
+                return ""
+            data = os.read(self.fd, 65536)
+        except OSError:
+            data = b""  # EIO from the pty: the shell has exited
+        if not data:
+            return None
+        return self._decoder.decode(data)
+
+    def write(self, data):
+        if not self._fd_open:
+            raise OSError("terminal closed")
+        view = memoryview(data)
+        while view:
+            view = view[os.write(self.fd, view):]
+
+    def resize(self, cols, rows):
+        if not self._fd_open:
+            raise OSError("terminal closed")
+        fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+
+    def release_fd(self):
+        if self._fd_open:
+            self._fd_open = False
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+
+    def close(self):
+        """Hang up the shell and reap it in the background."""
+        if self.closed:
+            return
+        self.closed = True
+        try:
+            os.killpg(self.pid, signal.SIGHUP)
+        except OSError:
+            pass
+        if not self.attached:
+            self.release_fd()
+        threading.Thread(target=self._reap, daemon=True).start()
+
+    def _reap(self):
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            try:
+                if os.waitpid(self.pid, os.WNOHANG)[0]:
+                    return
+            except ChildProcessError:
+                return
+            time.sleep(0.1)
+        try:
+            os.killpg(self.pid, signal.SIGKILL)
+            os.waitpid(self.pid, 0)
+        except OSError:
+            pass
+
+
+def _terminal_or_error(tid):
+    if not _terminal_enabled:
+        return None, (jsonify(error="The terminal is off; start the bridge with --enable-terminal"), 404)
+    with _terminals_lock:
+        session = _terminals.get(tid)
+    if session is None:
+        return None, (jsonify(error="No such terminal (it has exited)"), 404)
+    return session, None
+
+
+def _close_terminal(tid):
+    with _terminals_lock:
+        session = _terminals.pop(tid, None)
+    if session is not None:
+        session.close()
+        logger.info("Terminal %s closed", tid[:8])
+
+
+def close_all_terminals():
+    with _terminals_lock:
+        tids = list(_terminals)
+    for tid in tids:
+        _close_terminal(tid)
+
+
+def _size(body):
+    try:
+        return max(int(body.get("cols") or 80), 2), max(int(body.get("rows") or 24), 2)
+    except (TypeError, ValueError):
+        return 80, 24
+
+
+@app.route("/api/terminal", methods=["POST"])
+def terminal_open():
+    if not _terminal_enabled:
+        return jsonify(error="The terminal is off; start the bridge with --enable-terminal"), 404
+    cols, rows = _size(request.get_json(silent=True) or {})
+    with _terminals_lock:
+        if len(_terminals) >= TERMINAL_MAX_SESSIONS:
+            return jsonify(error=f"At most {TERMINAL_MAX_SESSIONS} terminals at once; close one first"), 429
+        tid = uuid.uuid4().hex
+        session = TerminalSession(cols, rows)
+        _terminals[tid] = session
+    logger.info("Terminal %s opened from %s (pid %d)", tid[:8], request.remote_addr, session.pid)
+    return jsonify(id=tid), 201
+
+
+@app.route("/api/terminal/<tid>/stream")
+def terminal_stream(tid):
+    session, error = _terminal_or_error(tid)
+    if error:
+        return error
+    if session.attached:
+        return jsonify(error="This terminal is already open in another tab"), 409
+
+    def generate():
+        # Claimed here, not above: a body that never starts never runs its
+        # finally, and an attached session would then keep its fd forever.
+        with _terminals_lock:
+            if session.attached:
+                return
+            session.attached = True
+        try:
+            while True:
+                out = session.read(TERMINAL_KEEPALIVE_S)
+                if out is None:
+                    yield "event: exit\ndata: {}\n\n"
+                    return
+                yield f"data: {json.dumps(out)}\n\n" if out else ": keepalive\n\n"
+        finally:
+            # The shell exited, or the tab went away (a write failed).
+            _close_terminal(tid)
+            session.release_fd()
+
+    return Response(generate(), mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.route("/api/terminal/<tid>/input", methods=["POST"])
+def terminal_input(tid):
+    session, error = _terminal_or_error(tid)
+    if error:
+        return error
+    try:
+        session.write(request.get_data())
+    except (OSError, ValueError):
+        return jsonify(error="The shell has exited"), 410
+    return "", 204
+
+
+@app.route("/api/terminal/<tid>/resize", methods=["POST"])
+def terminal_resize(tid):
+    session, error = _terminal_or_error(tid)
+    if error:
+        return error
+    try:
+        session.resize(*_size(request.get_json(silent=True) or {}))
+    except OSError:
+        return jsonify(error="The shell has exited"), 410
+    return "", 204
+
+
+@app.route("/api/terminal/<tid>/close", methods=["POST"])
+def terminal_close(tid):
+    _, error = _terminal_or_error(tid)
+    if error:
+        return error
+    _close_terminal(tid)
+    return "", 204
 
 
 _PAGE_HTML = """<!DOCTYPE html>
@@ -181,6 +418,12 @@ _PAGE_HTML = """<!DOCTYPE html>
      symbols ("°" and "m/s"); opt this span out of both. */
   .odo-unit{font-weight:400;color:var(--text2);text-transform:none;
     letter-spacing:0;font-family:var(--mono);font-size:.78rem;margin-left:6px;}
+
+  /* ---- Terminal (--enable-terminal only) ---- */
+  .toolbar code{font-family:var(--mono);color:var(--text);}
+  .term-warn{font-size:.75rem;color:var(--warning);margin-bottom:10px;}
+  #termContainer{height:calc(100vh - 230px);min-height:320px;background:#0a0c12;border:1px solid var(--border);
+    border-radius:var(--radius);padding:6px;overflow:hidden;}
 </style>
 </head>
 <body>
@@ -197,6 +440,7 @@ _PAGE_HTML = """<!DOCTYPE html>
   <div class="tab" data-view="camera" onclick="setView('camera')">Camera</div>
   <div class="tab" data-view="pointcloud" onclick="setView('pointcloud')">Point Cloud</div>
   <div class="tab" data-view="overlay" onclick="setView('overlay')">Overlay</div>
+  <div class="tab" data-view="terminal" id="terminalTab" style="display:none" onclick="setView('terminal')">Terminal</div>
 </div>
 <main>
   <div class="view active" id="view-history">
@@ -294,6 +538,16 @@ _PAGE_HTML = """<!DOCTYPE html>
       <span class="legend" id="ovStat"></span>
     </div>
     <div class="cam-view" id="ovView"><div class="empty-state">Select a camera and a lidar topic&hellip;</div></div>
+  </div>
+  <div class="view" id="view-terminal">
+    <div class="toolbar">
+      <button class="mini-btn" onclick="openShell()">New shell</button>
+      <span class="legend" id="termStat"></span>
+      <span class="legend" style="margin-left:auto;">e.g. <code>ros2 topic pub --once -w 1 /sim_reset std_msgs/msg/Empty</code></span>
+    </div>
+    <div class="term-warn">A root shell in the bridge container, with no login: anyone who can open this page can use it.
+      Closing the tab ends the shell.</div>
+    <div id="termContainer"></div>
   </div>
 </main>
 <script src="/static/three.min.js"></script>
@@ -1544,6 +1798,7 @@ function setView(name) {
   document.querySelectorAll('.tab').forEach((t) => t.classList.toggle('active', t.dataset.view === name));
   document.querySelectorAll('.view').forEach((v) => v.classList.toggle('active', v.id === 'view-' + name));
   if (name === 'pointcloud' && pcViewer) pcViewer.resize();
+  if (name === 'terminal') showTerminal();
   if (name === 'inspector' && inspPlot) { inspPlot._resize(); renderPlot(); }
   if (name === 'history') {
     // Canvases sized while the tab was display:none have a zero-width
@@ -1659,6 +1914,119 @@ async function loadSensorConfig() {
   } catch (e) { console.error('Failed to load sensor config', e); }
 }
 
+// ---------------------------------------------------------------------
+// Terminal tab (--enable-terminal only): a bash shell in this container on
+// a pseudo-terminal. Output arrives as Server-Sent Events and keystrokes go
+// up as POSTs, both to this page's own server (see terminal_* there). xterm.js
+// is loaded on first use, so the page costs nothing extra when unused.
+// ---------------------------------------------------------------------
+const TERMINAL_ENABLED = __TERMINAL_ENABLED__;
+let term = null, termFit = null, termId = null, termSource = null;
+let termPending = '', termSending = false;
+
+function setTermStat(text) { $('#termStat').textContent = text; }
+
+function loadAsset(tag, attrs) {
+  return new Promise((resolve, reject) => {
+    const el = Object.assign(document.createElement(tag), attrs);
+    el.onload = resolve;
+    el.onerror = () => reject(new Error('Could not load ' + (attrs.src || attrs.href)));
+    document.head.appendChild(el);
+  });
+}
+
+let termLoading = null;
+function showTerminal() {
+  if (!termLoading) {
+    termLoading = (async () => {
+      setTermStat('loading…');
+      await loadAsset('link', { rel: 'stylesheet', href: '/static/xterm/xterm.css' });
+      await loadAsset('script', { src: '/static/xterm/xterm.js' });
+      await loadAsset('script', { src: '/static/xterm/addon-fit.js' });
+      term = new Terminal({
+        cursorBlink: true, fontSize: 13, scrollback: 5000,
+        fontFamily: getComputedStyle(document.documentElement).getPropertyValue('--mono'),
+        theme: { background: '#0a0c12' },
+      });
+      termFit = new FitAddon.FitAddon();
+      term.loadAddon(termFit);
+      term.open($('#termContainer'));
+      term.onData((data) => { termPending += data; flushTermInput(); });
+      term.onResize(({ cols, rows }) => {
+        if (termId) fetch(`/api/terminal/${termId}/resize`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ cols, rows }),
+        }).catch(() => {});
+      });
+      window.addEventListener('resize', () => {
+        if ($('#view-terminal').classList.contains('active')) termFit.fit();
+      });
+      termFit.fit();
+      await openShell();
+    })().catch((e) => { termLoading = null; setTermStat(e.message); });
+  }
+  termLoading.then(() => { if (term) { termFit.fit(); term.focus(); } });
+}
+
+async function openShell() {
+  if (!term) { showTerminal(); return; }
+  closeShell();
+  term.reset();
+  setTermStat('starting…');
+  let res, body;
+  try {
+    res = await fetch('/api/terminal', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ cols: term.cols, rows: term.rows }),
+    });
+    body = await res.json().catch(() => ({}));
+  } catch (e) { setTermStat('Could not reach the visualizer'); return; }
+  if (!res.ok) { setTermStat(body.error || `HTTP ${res.status}`); return; }
+  const id = body.id;
+  termId = id;
+  termSource = new EventSource(`/api/terminal/${id}/stream`);
+  termSource.onmessage = (ev) => term.write(JSON.parse(ev.data));
+  termSource.addEventListener('exit', () => endShell(id, 'shell exited'));
+  // No automatic reconnect: the server ends the shell when its stream drops.
+  termSource.onerror = () => endShell(id, 'connection lost');
+  setTermStat('connected');
+  term.focus();
+}
+
+function endShell(id, why) {
+  if (id !== termId) return;
+  closeShell();
+  setTermStat(why + ' — New shell starts another');
+  term.write(`\\r\\n\\x1b[2m[${why}]\\x1b[0m\\r\\n`);
+}
+
+function closeShell() {
+  if (termSource) termSource.close();
+  if (termId) navigator.sendBeacon(`/api/terminal/${termId}/close`);
+  termSource = null; termId = null; termPending = '';
+}
+
+// One POST at a time, so keystrokes cannot overtake each other; whatever is
+// typed meanwhile goes up in the next one.
+async function flushTermInput() {
+  if (termSending) return;
+  termSending = true;
+  try {
+    while (termPending && termId) {
+      const id = termId, chunk = termPending;
+      termPending = '';
+      await fetch(`/api/terminal/${id}/input`, {
+        method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: chunk,
+      });
+    }
+  } catch (e) { /* the stream's error handler reports the lost connection */ }
+  finally { termSending = false; }
+}
+
+if (TERMINAL_ENABLED) {
+  $('#terminalTab').style.display = '';
+  window.addEventListener('pagehide', closeShell);
+}
+
 initRos();
 initInspector();
 loadSensorConfig();
@@ -1681,12 +2049,32 @@ def main():
     parser.add_argument("--rosbridge-port", type=int, default=9090,
                         help="Port the rosbridge websocket is listening on (must be reachable "
                              "from the browser at the same hostname this page is loaded from)")
+    parser.add_argument("--enable-terminal", action="store_true",
+                        default=os.environ.get("MAVSIM_ENABLE_TERMINAL", "").strip().lower()
+                        in ("1", "true", "yes", "on"),
+                        help="Add a Terminal tab: a bash shell in this container, with no login "
+                             "(default: off, or MAVSIM_ENABLE_TERMINAL=1)")
     args = parser.parse_args()
 
-    global _rosbridge_port
+    global _rosbridge_port, _terminal_enabled
     _rosbridge_port = args.rosbridge_port
+    _terminal_enabled = args.enable_terminal
 
     logger.info("Starting ROS2 visualizer on port %d (rosbridge port %d)", args.port, args.rosbridge_port)
+    if _terminal_enabled:
+        logger.warning("Terminal tab ENABLED: anyone who can reach port %d gets a root shell in "
+                       "this container. Use it on a trusted network only.", args.port)
+
+        # The shells run in their own sessions, so stopping this process's
+        # group does not reach them. Hang them up on the way out; if this
+        # process is SIGKILLed instead, the kernel hangs up each pty when its
+        # master fd closes, which ends the shell all the same.
+        def _shutdown(signum, _frame):
+            close_all_terminals()
+            sys.exit(128 + signum)
+
+        signal.signal(signal.SIGTERM, _shutdown)
+        signal.signal(signal.SIGINT, _shutdown)
     app.run(host="0.0.0.0", port=args.port, debug=False, threaded=True)
 
 

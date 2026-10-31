@@ -39,9 +39,15 @@ REM Usage:
 REM   start.bat
 REM   start.bat <controller-code> [--vessel-name NAME] [--backend-url URL]
 REM             [--frontend-url URL] [--rate HZ] [--ros-domain-id N]
-REM             [--cmd-timeout SEC] [--observe-others]
+REM             [--cmd-timeout SEC] [--observe-others] [--enable-terminal]
 REM   start.bat --token <path-to-token.json> [options...]
 REM   start.bat --mode web [--port 8888] [--backend-url URL] [--frontend-url URL] [--ros-domain-id N]
+REM             [--enable-terminal]
+REM
+REM --enable-terminal adds a Terminal tab to the visualizer (port 8899): a bash
+REM shell inside the container, e.g. for `ros2 topic pub` by hand. It has no
+REM login, so anyone who can reach port 8899 gets a root shell; use it on a
+REM trusted network only.
 REM
 REM By default this pulls the published mavlab/mavsim-controller:latest image
 REM (any --build flag can be combined with any of the above, in any order,
@@ -86,6 +92,10 @@ REM baked-in copies, so editing any of these locally takes effect on the
 REM next container start with no `docker build` needed.
 set "CORE_DIR=%SCRIPT_DIR%\core"
 set "CORE_FILES=base_controller.py python_controller.py run_controller.py recording_service.py local_sensor_generator.py observer.py visualizer_server.py"
+REM The visualizer's browser libraries (three.js, xterm.js), mounted over the
+REM image's /app/static like the files above.
+set "VENDOR_DIR=%CORE_DIR%\vendor"
+set "TERMINAL_ENV="
 
 REM ---- Opt-in local build (default is docker pull) ----
 REM For maintainers who've changed the Dockerfile itself (new OS dependency,
@@ -217,6 +227,7 @@ if "%MODE%"=="web" (
     echo [INFO]   ROS_DOMAIN_ID: !ROS_DOMAIN_ID_VAL!
     echo [INFO]   Recordings:   %RECORDINGS_DIR%
     echo [INFO]   Visualizer:   http://localhost:8899 (time histories, camera, point cloud, overlay)
+    if defined TERMINAL_ENV echo [WARN]   Terminal:     ENABLED in the visualizer - a root shell for anyone who can reach port 8899
     if "%GPU_AVAILABLE%"=="true" (
         echo [INFO]   GPU:          NVIDIA GPU detected - passing through for hardware-accelerated rendering
     ) else (
@@ -234,9 +245,11 @@ if "%MODE%"=="web" (
         -p "9090:9090" ^
         -p "8899:8899" ^
         -e "ROS_DOMAIN_ID=!ROS_DOMAIN_ID_VAL!" ^
+        !TERMINAL_ENV! ^
         -v "%RECORDINGS_DIR%:/tmp/mavsim_bags" ^
         -v "%BRIDGE_FILE%:/app/user_code/my_controller.py:ro" ^
         -v "%WEBAPP_FILE%:/app/user_code/bridge_webapp.py:ro" ^
+        -v "%VENDOR_DIR%:/app/static:ro" ^
         -v "%CORE_DIR%\base_controller.py:/app/base_controller.py:ro" ^
         -v "%CORE_DIR%\python_controller.py:/app/python_controller.py:ro" ^
         -v "%CORE_DIR%\run_controller.py:/app/run_controller.py:ro" ^
@@ -273,7 +286,7 @@ if "%TOKEN_FILE%"=="" if "%~1"=="" (
     echo [ERROR] (tip: run %~nx0 with no arguments at all for web mode instead)
     echo.
     echo Usage:
-    echo   %~nx0 ^<controller-code^> [--vessel-name NAME] [--backend-url URL] [--frontend-url URL] [--rate HZ] [--ros-domain-id N] [--cmd-timeout SEC] [--observe-others]
+    echo   %~nx0 ^<controller-code^> [--vessel-name NAME] [--backend-url URL] [--frontend-url URL] [--rate HZ] [--ros-domain-id N] [--cmd-timeout SEC] [--observe-others] [--enable-terminal]
     echo   %~nx0 --token ^<path-to-token.json^> [options...]
     echo   %~nx0 --mode web [--port 8888] [--backend-url URL] [--frontend-url URL] [--ros-domain-id N]
     exit /b 1
@@ -329,6 +342,11 @@ if "%~1"=="--observe-others" (
     shift
     goto :parse_cli_args
 )
+if "%~1"=="--enable-terminal" (
+    set "TERMINAL_ENV=-e MAVSIM_ENABLE_TERMINAL=1"
+    shift
+    goto :parse_cli_args
+)
 set "EXTRA_ARGS=!EXTRA_ARGS! %~1"
 shift
 goto :parse_cli_args
@@ -355,6 +373,7 @@ if "%GPU_AVAILABLE%"=="true" (
     echo [INFO]   GPU:          none detected - observer uses CPU-only SwiftShader rendering
 )
 if "%OBSERVE_OTHERS%"=="true" echo [INFO]   Observe-others: enabled
+if defined TERMINAL_ENV echo [WARN]   Terminal:     ENABLED in the visualizer - a root shell for anyone who can reach port 8899
 echo.
 
 REM Sensors (camera/lidar) are always enabled now, so these ports are always
@@ -372,8 +391,10 @@ if not "%TOKEN_FILE%"=="" (
         -e "ROS_DOMAIN_ID=%ROS_DOMAIN_ID_VAL%" ^
         -e "MAVSIM_CMD_TIMEOUT=%CMD_TIMEOUT%" ^
         %OBSERVE_ENV% ^
+        %TERMINAL_ENV% ^
         -v "%RECORDINGS_DIR%:/tmp/mavsim_bags" ^
         -v "%BRIDGE_FILE%:/app/user_code/my_controller.py:ro" ^
+        -v "%VENDOR_DIR%:/app/static:ro" ^
         -v "%TOKEN_FILE%:/app/token.json:ro" ^
         -v "%CORE_DIR%\base_controller.py:/app/base_controller.py:ro" ^
         -v "%CORE_DIR%\python_controller.py:/app/python_controller.py:ro" ^
@@ -393,8 +414,10 @@ if not "%TOKEN_FILE%"=="" (
         -e "ROS_DOMAIN_ID=%ROS_DOMAIN_ID_VAL%" ^
         -e "MAVSIM_CMD_TIMEOUT=%CMD_TIMEOUT%" ^
         %OBSERVE_ENV% ^
+        %TERMINAL_ENV% ^
         -v "%RECORDINGS_DIR%:/tmp/mavsim_bags" ^
         -v "%BRIDGE_FILE%:/app/user_code/my_controller.py:ro" ^
+        -v "%VENDOR_DIR%:/app/static:ro" ^
         -v "%CORE_DIR%\base_controller.py:/app/base_controller.py:ro" ^
         -v "%CORE_DIR%\python_controller.py:/app/python_controller.py:ro" ^
         -v "%CORE_DIR%\run_controller.py:/app/run_controller.py:ro" ^
@@ -441,6 +464,11 @@ if "%~1"=="--frontend-url" (
 if "%~1"=="--ros-domain-id" (
     set "ROS_DOMAIN_ID_VAL=%~2"
     shift & shift
+    goto :parse_web_args
+)
+if "%~1"=="--enable-terminal" (
+    set "TERMINAL_ENV=-e MAVSIM_ENABLE_TERMINAL=1"
+    shift
     goto :parse_web_args
 )
 echo [WARN] Unknown argument: %~1 (ignored)
