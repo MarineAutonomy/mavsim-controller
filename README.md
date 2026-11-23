@@ -89,6 +89,8 @@ Optional web-mode flags:
 | `--frontend-url` | `http://localhost:5173` | MAVSim frontend URL (needed for camera/lidar rendering) |
 | `--ros-domain-id` | `42` | ROS 2 domain ID for the bridge |
 | `--enable-terminal` | off | Adds a **Terminal** tab to the visualizer (see below) |
+| `--upload` | off | Also upload each recorded bag to the backend, for the dashboard's Recordings panel. Without it, bags are only saved in `./recordings/` |
+| `--rosbridge-port` | `9090` | Port of the bridge's own rosbridge, which the visualizer uses. On Linux the bridge shares the host's network, so move it if the host already runs a rosbridge on 9090 |
 
 Recordings are written to `./recordings/`. A local visualizer is available at http://localhost:8899 and keyboard teleop at http://localhost:8900.
 

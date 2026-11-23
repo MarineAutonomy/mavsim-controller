@@ -11,16 +11,20 @@ License: MIT
 
 import argparse
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import re
 import signal
+import socket
 import subprocess
 import sys
 import threading
 import time
 from typing import Dict, Optional
+
+import numpy as np
 
 from python_controller import MavsimAPIClient, MavsimController, VesselState
 
@@ -113,6 +117,49 @@ SENSOR_BRIDGE_BASE_PORT = 7000
 SENSOR_BRIDGE_VESSEL_STRIDE = 10
 
 
+def _stable_controller_id() -> str:
+    """This machine's bridge, as the controllerId sent with every handshake.
+
+    The same across bridge restarts (each one a new container), so a
+    restarted bridge can take back the vessel it held instead of getting
+    409 "already controlled" - once the backend lets a handshake re-bind a
+    vessel bound to the same controllerId. MAVSIM_CONTROLLER_ID overrides
+    it; otherwise it is a hash of MAVSIM_HOST_ID (start.sh passes the host's
+    machine id) or this hostname."""
+    explicit = os.environ.get('MAVSIM_CONTROLLER_ID', '').strip()
+    if explicit:
+        return explicit
+    host = os.environ.get('MAVSIM_HOST_ID', '').strip() or socket.gethostname()
+    return 'bridge-' + hashlib.sha256(host.encode()).hexdigest()[:16]
+
+
+def _env_seconds(name: str, default: float) -> float:
+    try:
+        return max(0.0, float(os.environ.get(name, default)))
+    except ValueError:
+        return default
+
+
+def _stamp_now(node=None):
+    """builtin_interfaces/Time for now: from the node's clock when there is
+    one (wall-clock time unless use_sim_time is set), else time.time()."""
+    if node is not None:
+        return node.get_clock().now().to_msg()
+    from builtin_interfaces.msg import Time
+    now = time.time()
+    sec = int(now)
+    return Time(sec=sec, nanosec=int((now - sec) * 1e9))
+
+
+def _sensor_frame_id(topic: str) -> str:
+    """A body-mounted sensor's frame, from its topic:
+    /sookshma_01/imu_01/data -> sookshma_01/imu_01."""
+    frame = topic.strip('/')
+    if frame.endswith('/data'):
+        frame = frame[:-len('/data')]
+    return frame
+
+
 def _sensor_bridge_ports_for_vessel(vessel_id: int, base_port: int = SENSOR_BRIDGE_BASE_PORT):
     """Compute per-vessel camera/lidar bridge ports from vessel_id."""
     vid = max(0, min(255, int(vessel_id)))
@@ -172,6 +219,15 @@ class BaseController:
                 (default: 8901)
         """
         self.controller_code = controller_code
+        self.controller_id = _stable_controller_id()
+        # Bags are always saved locally (./recordings/ via start.sh). Off by
+        # default; start.sh --upload sets MAVSIM_UPLOAD_BAGS=1 to also upload
+        # each one to the backend, for the dashboard's Recordings panel.
+        self.upload_bags = os.environ.get('MAVSIM_UPLOAD_BAGS', '0').strip() == '1'
+        # How long close() waits for an upload still running before exiting.
+        self.upload_timeout = _env_seconds('MAVSIM_UPLOAD_TIMEOUT', 120.0)
+        self._upload_thread: Optional[threading.Thread] = None
+        self._upload_bag_path: Optional[str] = None
         self.frontend_url = frontend_url
         self.backend_url = backend_url
         self.vessel_name = vessel_name
@@ -333,6 +389,10 @@ class BaseController:
             # Set up local ROS2 republishers for bag recording
             self._setup_local_republishers()
 
+            # Republish state and feed the sensor generators on every
+            # vessel_state message, not once per control tick.
+            self._wire_state_fanout()
+
             # Start recording polling (uses first api_client) LAST, after every
             # local ROS2 publisher (republishers, sensor generators, camera/lidar
             # bridge topics) has been created. Recording's topic discovery takes
@@ -422,7 +482,8 @@ class BaseController:
             api_client, handshake_data = MavsimAPIClient.from_handshake(
                 backend_url=self.backend_url,
                 controller_code=self.controller_code,
-                vessel_name=vessel_name
+                vessel_name=vessel_name,
+                controller_id=self.controller_id,
             )
 
             session_id = handshake_data['sessionId']
@@ -513,7 +574,8 @@ class BaseController:
         except Exception as e:
             err_str = str(e)
             if '409' in err_str or 'already controlled' in err_str.lower():
-                logger.warning(f"Vessel {vessel_name} already controlled (409), skipping")
+                logger.warning(f"Vessel {vessel_name} already controlled (409) by another "
+                               f"controller (this one is {self.controller_id}), skipping")
             else:
                 logger.error(f"Handshake failed for vessel {vessel_name}: {e}", exc_info=True)
             return False
@@ -621,46 +683,57 @@ class BaseController:
         from std_msgs.msg import UInt32
         self._reset_event_pub = self._ros2_node.create_publisher(UInt32, '/sim_reset_event', 10)
 
-    def _republish_to_local_ros2(self):
-        """Republish rosbridge data and generate odometry on local ROS2 topics."""
-        if not self._ros2_republishers:
-            return
+    def _wire_state_fanout(self):
+        """Handle each owned vessel's vessel_state/vessel_state_der message as
+        it arrives (rosbridge thread): republish it, its odometry_sim, and feed
+        its sensor generator.
 
-        try:
-            from std_msgs.msg import Float64MultiArray
-        except ImportError:
-            return
-
+        This used to happen in the control loop, so local state topics and the
+        sensor generators only saw a new state once per control tick (about
+        5 Hz with the REST round trip), whatever rate the simulator sent at;
+        the 80-100 Hz IMU dead-reckoned across each 200 ms gap."""
         for vname in self._controlled_vessels:
             ctrl = self._controllers.get(vname)
-            if not ctrl:
+            if ctrl is None:
                 continue
+            ctrl.add_state_callback(
+                lambda ros_name, data, _v=vname: ros_name == _v and self._on_vessel_state_msg(_v, data))
+            ctrl.add_state_der_callback(
+                lambda ros_name, data, _v=vname: ros_name == _v and self._on_vessel_state_der_msg(_v, data))
 
-            raw_state = ctrl.get_raw_state(vname)
-            if raw_state is not None:
-                pub = self._ros2_republishers.get(f"{vname}/vessel_state")
-                if pub:
-                    msg = Float64MultiArray()
-                    msg.data = [float(x) for x in raw_state]
-                    pub.publish(msg)
+    def _on_vessel_state_msg(self, vname: str, data: list):
+        """One vessel_state message ([sim_time, *state]) for an owned vessel."""
+        if not data:
+            return
+        ctrl = self._controllers.get(vname)
+        state = np.asarray(data[1:], dtype=float)
+        sim_time = float(data[0])
 
-                # Generate odometry_sim locally from vessel_state instead of
-                # subscribing to a separate server topic.
-                pub_odom = self._ros2_republishers.get(f"{vname}/odometry_sim")
-                if pub_odom:
-                    self._publish_local_odometry(pub_odom, raw_state, ctrl.use_quaternion)
+        gen = self._sensor_generators.get(vname)
+        if gen is not None and ctrl is not None:
+            gen.update_state(state, ctrl.get_raw_state_der(vname), sim_time=sim_time)
 
-            raw_der = ctrl.get_raw_state_der(vname)
-            if raw_der is not None:
-                pub = self._ros2_republishers.get(f"{vname}/vessel_state_der")
-                if pub:
-                    msg = Float64MultiArray()
-                    msg.data = [float(x) for x in raw_der]
-                    pub.publish(msg)
+        pub = self._ros2_republishers.get(f"{vname}/vessel_state")
+        if pub is not None:
+            from std_msgs.msg import Float64MultiArray
+            pub.publish(Float64MultiArray(data=[float(x) for x in state]))
+
+        pub_odom = self._ros2_republishers.get(f"{vname}/odometry_sim")
+        if pub_odom is not None and ctrl is not None:
+            self._publish_local_odometry(pub_odom, state, ctrl.use_quaternion,
+                                         stamp=_stamp_now(self._ros2_node))
+
+    def _on_vessel_state_der_msg(self, vname: str, data: list):
+        """One vessel_state_der message ([sim_time, *state_der])."""
+        pub = self._ros2_republishers.get(f"{vname}/vessel_state_der")
+        if pub is not None and data:
+            from std_msgs.msg import Float64MultiArray
+            pub.publish(Float64MultiArray(data=[float(x) for x in data[1:]]))
 
     @staticmethod
-    def _publish_local_odometry(pub, raw_state, use_quaternion: bool):
-        """Build and publish an Odometry message from the raw vessel_state array.
+    def _publish_local_odometry(pub, raw_state, use_quaternion: bool, stamp=None):
+        """Build and publish an Odometry message from the raw vessel_state array,
+        stamped with `stamp` (the wall-clock time the state arrived).
 
         State layout (after timestamp strip):
         [u, v, w, p, q, r, x, y, z, phi/q0, theta/q1, psi/q2, (q3), ...]
@@ -671,6 +744,8 @@ class BaseController:
             import numpy as np
 
             msg = OdometryMsg()
+            if stamp is not None:
+                msg.header.stamp = stamp
             msg.header.frame_id = 'NED'
             msg.child_frame_id = 'BODY'
 
@@ -697,18 +772,6 @@ class BaseController:
             pub.publish(msg)
         except Exception as e:
             logger.debug(f"Error generating local odometry: {e}")
-
-    def _update_sensor_states(self):
-        """Feed latest raw state/state_der from rosbridge into sensor generators."""
-        for vname, gen in self._sensor_generators.items():
-            ctrl = self._controllers.get(vname)
-            if not ctrl:
-                continue
-            state = ctrl.get_raw_state(vname)
-            state_der = ctrl.get_raw_state_der(vname)
-            sim_time = ctrl.get_raw_state_time(vname)
-            if state is not None:
-                gen.update_state(state, state_der, sim_time=sim_time)
 
     def _init_ros2_sensor_node(self):
         """Lazily initialize a local ROS2 node for publishing sensor topics."""
@@ -739,7 +802,8 @@ class BaseController:
                 self._ros2_sensor_pubs[topic] = {'pub': pub, 'type': sensor_type, 'msg_type': msg_type}
 
             pub_info = self._ros2_sensor_pubs[topic]
-            msg = self._build_sensor_msg(pub_info['type'], measurement, node=self._ros2_node)
+            msg = self._build_sensor_msg(pub_info['type'], measurement, node=self._ros2_node,
+                                         frame_id=_sensor_frame_id(topic))
             if msg is not None:
                 pub_info['pub'].publish(msg)
         except Exception as e:
@@ -759,6 +823,9 @@ class BaseController:
             elif stype == 'dvl':
                 from geometry_msgs.msg import TwistWithCovarianceStamped
                 return TwistWithCovarianceStamped
+            elif stype in ('uwb', 'depth', 'compass'):
+                from geometry_msgs.msg import PoseWithCovarianceStamped
+                return PoseWithCovarianceStamped
             elif stype == 'encoder':
                 from std_msgs.msg import Float64MultiArray
                 return Float64MultiArray
@@ -770,20 +837,25 @@ class BaseController:
         return None
 
     @staticmethod
-    def _build_sensor_msg(sensor_type: str, measurement: dict, node=None):
+    def _build_sensor_msg(sensor_type: str, measurement: dict, node=None, frame_id: str = ''):
         """Build a ROS2 message from a sensor measurement dict.
 
-        `node` is only used by sensor types (e.g. waveprobe) that need a ROS
-        clock to stamp their header -- most sensor types here don't stamp a
-        header at all and ignore it.
+        Every message with a header is stamped with the time it is generated,
+        from `node`'s clock (wall-clock time, the same clock as the camera
+        frames' stamps), or from time.time() when there is no node. frame_id
+        is the sensor's own frame for body-mounted measurements (IMU, GPS,
+        DVL); UWB, depth and compass are poses in the world 'NED' frame.
         """
         import numpy as np
         stype = sensor_type.lower()
         try:
+            stamp = _stamp_now(node)
             if stype == 'imu':
                 from sensor_msgs.msg import Imu
                 from geometry_msgs.msg import Quaternion, Vector3
                 msg = Imu()
+                msg.header.stamp = stamp
+                msg.header.frame_id = frame_id
                 q = measurement['orientation']
                 msg.orientation = Quaternion(w=float(q[0]), x=float(q[1]),
                                              y=float(q[2]), z=float(q[3]))
@@ -798,7 +870,11 @@ class BaseController:
 
             elif stype == 'gps':
                 from sensor_msgs.msg import NavSatFix
+                from sensor_msgs.msg import NavSatStatus
                 msg = NavSatFix()
+                msg.header.stamp = stamp
+                msg.header.frame_id = frame_id
+                msg.status = NavSatStatus(status=NavSatStatus.STATUS_FIX, service=NavSatStatus.SERVICE_GPS)
                 msg.latitude = float(measurement['latitude'])
                 msg.longitude = float(measurement['longitude'])
                 msg.altitude = float(measurement['altitude'])
@@ -810,6 +886,8 @@ class BaseController:
             elif stype == 'dvl':
                 from geometry_msgs.msg import TwistWithCovarianceStamped, Vector3
                 msg = TwistWithCovarianceStamped()
+                msg.header.stamp = stamp
+                msg.header.frame_id = frame_id
                 vel = measurement['velocity']
                 msg.twist.twist.linear = Vector3(
                     x=float(vel[0]), y=float(vel[1]), z=float(vel[2])
@@ -820,7 +898,22 @@ class BaseController:
                 msg.twist.covariance = [float(x) for x in cov_6x6.flatten()]
                 return msg
 
+            elif stype in ('uwb', 'depth', 'compass'):
+                from geometry_msgs.msg import PoseWithCovarianceStamped, Point, Quaternion
+                msg = PoseWithCovarianceStamped()
+                msg.header.stamp = stamp
+                msg.header.frame_id = 'NED'
+                pos = measurement['position']
+                q = measurement['orientation']
+                msg.pose.pose.position = Point(x=float(pos[0]), y=float(pos[1]), z=float(pos[2]))
+                msg.pose.pose.orientation = Quaternion(w=float(q[0]), x=float(q[1]),
+                                                       y=float(q[2]), z=float(q[3]))
+                msg.pose.covariance = [float(x) for x in measurement['covariance']]
+                return msg
+
             elif stype == 'encoder':
+                # std_msgs/Float64MultiArray has no header, so encoder values
+                # cannot carry a stamp.
                 from std_msgs.msg import Float64MultiArray
                 msg = Float64MultiArray()
                 msg.data = [float(v) for v in measurement.get('actuator_values', [])]
@@ -830,8 +923,7 @@ class BaseController:
                 from interfaces.msg import WaveProbe
                 from geometry_msgs.msg import Point
                 msg = WaveProbe()
-                if node is not None:
-                    msg.header.stamp = node.get_clock().now().to_msg()
+                msg.header.stamp = stamp
                 msg.header.frame_id = 'waveprobe_frame'
                 msg.elevation = float(measurement['elevation'])
                 msg.location = Point(
@@ -849,8 +941,12 @@ class BaseController:
         
         Args:
             topics: List of topics to record (None = record all vessel topics)
-            namespace: Topic discovery prefix. On the local container, vessel
-                       names are used (no simulation namespace).
+            namespace: Topic discovery prefix. Used only when no vessel is
+                       bound: local topics are /<vessel>/..., without the
+                       simulation namespace the backend's recording command
+                       carries (/sim_abc123/), so preferring that one matched
+                       nothing and recording failed with "No topics
+                       discovered after retries".
         """
         if self._recording:
             logger.warning("Recording already in progress")
@@ -868,12 +964,12 @@ class BaseController:
         
         # For local topic discovery, use vessel name(s) as prefix instead of
         # the simulation namespace since local topics omit the namespace.
-        if namespace:
-            self._recording_namespace = namespace
-        elif self._controlled_vessels:
+        if self._controlled_vessels:
             self._recording_namespace = f"/{self._controlled_vessels[0]}"
         elif self.vessel_name:
             self._recording_namespace = f"/{self.vessel_name}"
+        elif namespace:
+            self._recording_namespace = namespace
         elif self._controller:
             self._recording_namespace = self._controller.namespace
         
@@ -881,15 +977,18 @@ class BaseController:
             logger.error("No namespace/vessel prefix available for recording")
             return
         
-        # For multi-vessel auto-discovery (topics=None), record every
+        # For auto-discovery (topics=None), record every
         # controlled vessel's namespace via regex instead of pre-discovering
         # a static topic list -- RecordingService keeps matching new topics
         # (e.g. a camera publisher that only appears once the browser sends
         # its first frame) for the life of the recording, rather than
         # freezing the topic list at this instant.
+        # /sim_reset_event (session-wide, outside every vessel prefix) goes in
+        # too, so a bag can be split into trials.
         namespaces = None
-        if topics is None and len(self._controlled_vessels) > 1:
-            namespaces = [f"/{v}" for v in self._controlled_vessels]
+        if topics is None:
+            vessels = self._controlled_vessels or [self._recording_namespace.strip('/')]
+            namespaces = [f"/{v.strip('/')}" for v in vessels] + ['/sim_reset_event']
 
         self._recording_topics = topics
 
@@ -947,19 +1046,38 @@ class BaseController:
             self._report_recording_status('stopped', self._recording_topics)
             logger.info("Recording stopped")
 
-            # Upload to cloud backend in a background thread so it doesn't
-            # block the polling loop or controller shutdown.
+            # Upload to the backend in a background thread so it doesn't block
+            # the polling loop; close() waits for it (up to upload_timeout)
+            # before the process exits, which used to kill it mid-upload.
             if bag_path and self._api_client:
-                upload_thread = threading.Thread(
-                    target=self._upload_bag_async,
-                    args=(bag_path,),
-                    daemon=True,
-                )
-                upload_thread.start()
+                if not self.upload_bags:
+                    logger.info(f"Bag saved locally at {bag_path} (not uploaded; start.sh --upload uploads it)")
+                else:
+                    self._upload_bag_path = bag_path
+                    self._upload_thread = threading.Thread(
+                        target=self._upload_bag_async,
+                        args=(bag_path,),
+                        daemon=True,
+                        name="bag-upload",
+                    )
+                    self._upload_thread.start()
 
         except Exception as e:
             logger.error(f"Failed to stop recording: {e}")
             self._report_recording_status('error', self._recording_topics, error=str(e))
+
+    def _wait_for_upload(self):
+        """Give a running bag upload up to upload_timeout to finish."""
+        thread = self._upload_thread
+        if thread is None or not thread.is_alive():
+            return
+        logger.info(f"Waiting up to {self.upload_timeout:.0f} s for the bag upload to finish...")
+        thread.join(timeout=self.upload_timeout)
+        if thread.is_alive():
+            logger.warning(
+                f"Bag upload did not finish within {self.upload_timeout:.0f} s and was abandoned; "
+                f"the bag is still saved locally at {self._upload_bag_path}"
+            )
 
     def _upload_bag_async(self, bag_path: str):
         """Background upload of a bag file to the cloud backend."""
@@ -1007,10 +1125,20 @@ class BaseController:
             logger.debug(f"Failed to poll recording command: {e}")
             return None
     
+    SESSION_CHECK_PERIOD = 5.0  # seconds between session status checks
+
     def _poll_recording_loop(self):
-        """Background thread that polls for recording commands."""
+        """Background thread that polls the backend: for recording commands
+        every 2 s, and for the session's status every SESSION_CHECK_PERIOD,
+        so the bridge notices a stopped session even when nothing is
+        commanding it (the control loop then shuts it down, finalizing and
+        uploading any recording)."""
         MAX_RECORDING_RETRIES = 10
+        next_session_check = time.monotonic() + self.SESSION_CHECK_PERIOD
         while self._polling_active:
+            if time.monotonic() >= next_session_check:
+                next_session_check = time.monotonic() + self.SESSION_CHECK_PERIOD
+                self._check_session_status()
             try:
                 command_data = self.poll_recording_command()
                 
@@ -1031,6 +1159,17 @@ class BaseController:
             
             time.sleep(2.0)
     
+    def _check_session_status(self):
+        """One backend status check; the session is shared by all vessels,
+        so the primary client is enough."""
+        ctrl = self._controller
+        if ctrl is None or not hasattr(ctrl, 'check_session_status'):
+            return
+        try:
+            ctrl.check_session_status()
+        except Exception as e:
+            logger.debug(f"Session status check error: {e}")
+
     def _start_polling(self):
         """Start background polling thread."""
         if self._polling_active:
@@ -1105,19 +1244,12 @@ class BaseController:
         - A nested dict {'matsya_02': {'cs_01': 5.0}, 'matsya_03': {...}} -> per-vessel dispatch
         """
         period = 1.0 / self._control_rate_hz
-        
+        next_tick = time.monotonic() + period
+
         while self._running:
             try:
                 if self._reset_count != self._reset_handled:
                     self._handle_reset()
-
-                # Feed latest state into local sensor generators
-                if self._sensor_generators:
-                    self._update_sensor_states()
-
-                # Republish server data to local ROS2 for bag recording
-                if self._ros2_republishers:
-                    self._republish_to_local_ros2()
 
                 # Aggregate vessel states from all controllers
                 vessel_states = {}
@@ -1136,7 +1268,7 @@ class BaseController:
                     if self._session_ended():
                         self._handle_session_ended()
                         return
-                    time.sleep(period)
+                    next_tick = self._wait_for_tick(next_tick, period)
                     continue
                 
                 result = self.control_loop(vessel_states)
@@ -1161,7 +1293,20 @@ class BaseController:
             except Exception as e:
                 logger.error(f"Control loop error: {e}", exc_info=True)
 
-            time.sleep(period)
+            next_tick = self._wait_for_tick(next_tick, period)
+
+    @staticmethod
+    def _wait_for_tick(next_tick: float, period: float) -> float:
+        """Sleep until next_tick and return the tick after it, so the loop
+        runs at a fixed rate: the tick's own work (a REST round trip of tens
+        of ms) no longer stretches the period, as a plain sleep(period) did.
+        A tick that overran starts the next one at once, without bursting
+        to catch up on the ones it missed."""
+        now = time.monotonic()
+        if next_tick > now:
+            time.sleep(next_tick - now)
+            return next_tick + period
+        return now + period
 
     def _all_clients(self):
         """Every API client this controller drives, primary and per-vessel."""
@@ -1744,6 +1889,13 @@ class BaseController:
 
         self._running = False
 
+        # Recording first: finalize the bag and start its upload now, so the
+        # upload runs while the rest is torn down. Polling stops before it,
+        # or its next poll would see "start" again and restart recording.
+        self._stop_polling()
+        if self._recording:
+            self.stop_recording()
+
         # Stop the observer/rosbridge/visualizer subprocesses, if running.
         # Guarded so close() being called more than once (both the
         # SIGINT/SIGTERM handler and run()'s finally block can call it) is a
@@ -1826,15 +1978,9 @@ class BaseController:
                 pass
             self._ros2_node = None
         
-        # Stop polling
-        self._stop_polling()
-        
         if self._control_thread and self._control_thread.is_alive():
             self._control_thread.join(timeout=2.0)
-        
-        if self._recording:
-            self.stop_recording()
-        
+
         # Close all vessel controllers
         for vname, ctrl in self._controllers.items():
             try:
@@ -1846,7 +1992,9 @@ class BaseController:
         # Fallback for single-vessel mode if not in _controllers
         if self._controller and self._controller not in self._controllers.values():
             self._controller.close()
-        
+
+        self._wait_for_upload()
+
         logger.info("Controller closed")
     
     def run(self, rate_hz: float = 10.0):
@@ -1907,8 +2055,10 @@ def create_controller_from_args() -> BaseController:
                        help='Base port for auto sensor bridge ports (default: 7000)')
     parser.add_argument('--rate', type=float, default=10.0,
                        help='Control loop rate in Hz (default: 10.0)')
-    parser.add_argument('--rosbridge-port', type=int, default=9090,
-                       help='Local rosbridge websocket port for the ROS2 topic visualizer (default: 9090)')
+    parser.add_argument('--rosbridge-port', type=int,
+                       default=int(os.environ.get('MAVSIM_ROSBRIDGE_PORT', 9090)),
+                       help='Local rosbridge websocket port for the ROS2 topic visualizer '
+                       '(default: $MAVSIM_ROSBRIDGE_PORT, else 9090)')
     parser.add_argument('--visualizer-port', type=int, default=8899,
                        help='Local ROS2 topic visualizer port (default: 8899)')
     parser.add_argument('--teleop-http-port', type=int, default=8900,

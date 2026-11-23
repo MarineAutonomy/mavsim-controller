@@ -15,11 +15,16 @@ Three concerns, one process:
     6DOF command (surge/sway/heave/roll/pitch/yaw, each in [-1,1]) toward
     whatever its currently-held keys imply, or back toward 0 if released/
     disconnected (dead-man safety), runs it through that vessel's
-    ThrustAllocator (allocation.py), and publishes the result. It publishes
-    continuously, even all-zero - bridge_controller.py's own
-    MAVSIM_CMD_TIMEOUT (default 1s) is a second, independent dead-man
-    backstop if this whole process dies; this loop's own ramp is the smooth
-    front line, not a replacement for it.
+    ThrustAllocator (allocation.py), and publishes the result - but only
+    while someone is driving: while a key is held or the command is still
+    ramping back to zero, then IDLE_TAIL_MESSAGES all-zero messages for a
+    clean stop, then nothing. It used to publish continuously, even all-zero,
+    and since bridge_controller.py keeps only the latest message on
+    /<vessel>/actuator_cmd, those zeros overwrote any other node's commands
+    on the same topic (an external controller's 2000 RPM see-sawed against
+    teleop's 0). Once teleop goes quiet, bridge_controller.py's
+    MAVSIM_CMD_TIMEOUT (default 1s) and the simulator's watchdog are the
+    dead-man backstop, as they already were if this whole process dies.
   - A WebSocket server (its own asyncio loop/thread) receives raw key
     up/down events from the browser and pushes ramped-command telemetry
     back for the page's live DOF meters.
@@ -73,6 +78,12 @@ KEY_MAP = {
 
 DOF_LABELS = ("Surge", "Sway", "Heave", "Roll", "Pitch", "Yaw")
 
+# All-zero messages published after a vessel's command has ramped back to
+# zero, so the stop gets through even if one message is lost; after these,
+# teleop stops publishing for that vessel and leaves the topic to any other
+# controller.
+IDLE_TAIL_MESSAGES = 5
+
 
 def _import_actuator():
     """Lazy import guard, same pattern as bridge_controller.py's
@@ -107,6 +118,7 @@ class VesselTeleop:
         if node is not None and actuator_cls is not None:
             self.pub = node.create_publisher(actuator_cls, f"/{name}/actuator_cmd", 10)
         self.cmd = np.zeros(6)
+        self._zeros_left = 0  # all-zero messages still to publish after stopping
         self._held_keys = set()
         self._lock = threading.Lock()
 
@@ -139,7 +151,20 @@ class VesselTeleop:
         max_step = dt / max(ramp_seconds, 1e-6)
         change = np.clip(target - self.cmd, -max_step, max_step)
         self.cmd = np.clip(self.cmd + change, -1.0, 1.0)
+        if np.any(target) or np.any(self.cmd):
+            self._zeros_left = IDLE_TAIL_MESSAGES
         return self.cmd
+
+    def publish_due(self) -> bool:
+        """Whether this tick's command should be published: always while
+        the command is non-zero, then for IDLE_TAIL_MESSAGES ticks of zeros,
+        then not until someone drives again. Call once per tick, after step()."""
+        if np.any(self.cmd):
+            return True
+        if self._zeros_left > 0:
+            self._zeros_left -= 1
+            return True
+        return False
 
     def publish(self, actuator_cls):
         if self.pub is None or actuator_cls is None:
@@ -234,7 +259,8 @@ class TeleopServer:
     # ------------------------------------------------------------------
 
     def run_command_loop(self):
-        """Publish every vessel's command at a fixed rate.
+        """Step every vessel's command at a fixed rate, publishing it while
+        someone is driving that vessel (see VesselTeleop.publish_due()).
 
         Errors are logged and the loop carries on: an exception used to end
         this thread silently, leaving a page that still took keys and sent
@@ -250,7 +276,8 @@ class TeleopServer:
             for name, vessel in list(self.vessels.items()):
                 try:
                     vessel.step(period, self.ramp_seconds)
-                    vessel.publish(self.actuator_cls)
+                    if vessel.publish_due():
+                        vessel.publish(self.actuator_cls)
                 except Exception as exc:
                     # Log each distinct error at most every 10 s.
                     key = (name, type(exc).__name__, str(exc))

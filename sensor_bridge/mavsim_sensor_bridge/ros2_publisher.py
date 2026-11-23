@@ -9,6 +9,7 @@ Classes:
     LocalROS2LidarPublisher  - Publishes lidar point clouds as sensor_msgs/PointCloud2
 """
 
+import array
 import logging
 import struct
 import threading
@@ -156,9 +157,14 @@ class LocalROS2CameraPublisher:
             msg = CompressedImage()
             msg.header.stamp.sec = sec
             msg.header.stamp.nanosec = nsec
-            msg.header.frame_id = ""
+            # The camera's own frame, as the bridge names its other sensors'
+            # frames (sookshma_01/imu_01): it used to be empty.
+            msg.header.frame_id = f"{self.vessel_name}/camera_{camera_id:02d}"
             msg.format = "jpeg"
-            msg.data = list(jpeg_data)
+            # array('B') is rclpy's native type for uint8[]: anything else
+            # (list(jpeg_data) did) is checked and converted byte by byte, a
+            # cost paid on every frame.
+            msg.data = array.array("B", jpeg_data)
             pub.publish(msg)
         except Exception as e:
             self._log.warning("Failed to publish camera frame: %s", e)
@@ -341,7 +347,7 @@ class LocalROS2LidarPublisher:
 
             # Ensure float32 little-endian and flatten to bytes
             pts = np.ascontiguousarray(points[:, :4].astype(np.float32))
-            msg.data = pts.tobytes()
+            msg.data = array.array("B", pts.tobytes())  # see publish_frame()
 
             pub.publish(msg)
         except Exception as e:

@@ -171,9 +171,10 @@ def main():
                            help='Base port for auto sensor bridge ports (default: 7000)')
         parser.add_argument('--rate', type=float, default=10.0,
                            help='Control loop rate in Hz (default: 10.0)')
-        parser.add_argument('--rosbridge-port', type=int, default=9090,
+        parser.add_argument('--rosbridge-port', type=int,
+                           default=int(os.environ.get('MAVSIM_ROSBRIDGE_PORT', 9090)),
                            help='Local rosbridge websocket port for the ROS2 topic visualizer '
-                                '(default: 9090)')
+                                '(default: $MAVSIM_ROSBRIDGE_PORT, else 9090)')
         parser.add_argument('--visualizer-port', type=int, default=8899,
                            help='Local ROS2 topic visualizer port (default: 8899)')
         parser.add_argument('--teleop-http-port', type=int, default=8900,

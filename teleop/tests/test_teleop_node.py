@@ -11,6 +11,13 @@ page still took keys and sent telemetry. These pin the fixes:
   - the node exits when the controller that launched it is gone;
   - it refuses to start when its ports are taken.
 
+Teleop goes quiet when idle (2026-11-23): it used to publish all-zero
+commands at 20 Hz on /<vessel>/actuator_cmd even when nobody was driving, and
+since the bridge keeps only the latest message on that topic, the zeros
+overwrote an external controller's commands (thrusters see-sawed between its
+2000 RPM and teleop's 0). It now publishes only while a key is held or the
+command is ramping back down, plus a few closing zeros.
+
 No ROS needed (rclpy missing -> commands are computed, not published):
     python3 -m pytest teleop/tests/test_teleop_node.py
 """
@@ -62,6 +69,7 @@ class TestCommandLoop(unittest.TestCase):
     def test_keeps_running_after_an_error(self):
         server = tn.TeleopServer(self.config, rate=50.0, ramp_seconds=0.5)
         vessel = server.vessels['Mako_01']
+        vessel.set_key('ArrowUp', True)             # driving, so it publishes every tick
         calls = []
 
         def flaky(_actuator_cls):
@@ -91,6 +99,92 @@ class TestCommandLoop(unittest.TestCase):
         write_config(self.config, ['Mako_01', 'dock_02'])
         run_loop(server, 0.3)
         self.assertIs(server.vessels['Mako_01'], original)    # held keys / ramp state kept
+
+
+class TestIdleQuiet(unittest.TestCase):
+    DT, RAMP = 0.05, 0.5                            # 20 Hz, 10 ticks for a full 0 -> 1 ramp
+
+    def make_vessel(self):
+        return tn.VesselTeleop('Mako_01', [THRUSTER], [], node=None, actuator_cls=None)
+
+    def tick(self, vessel):
+        vessel.step(self.DT, self.RAMP)
+        return vessel.publish_due()
+
+    def test_idle_vessel_never_publishes(self):
+        vessel = self.make_vessel()
+        self.assertFalse(any(self.tick(vessel) for _ in range(200)))
+
+    def test_publishes_while_driving_then_a_few_zeros_then_stops(self):
+        vessel = self.make_vessel()
+        vessel.set_key('ArrowUp', True)
+        self.assertTrue(all(self.tick(vessel) for _ in range(30)))
+        self.assertEqual(vessel.cmd[0], 1.0)
+
+        vessel.set_key('ArrowUp', False)
+        sent = []
+        for _ in range(60):
+            if self.tick(vessel):
+                sent.append(vessel.cmd.copy())
+        ramp_down = [c for c in sent if c.any()]
+        zeros = [c for c in sent if not c.any()]
+        # Every tick of the ramp (0.9, 0.8, ...; float residue can add one
+        # near-zero tick) is sent, falling all the way.
+        self.assertGreaterEqual(len(ramp_down), 9)
+        self.assertAlmostEqual(ramp_down[0][0], 0.9)
+        self.assertTrue(all(a[0] > b[0] for a, b in zip(ramp_down, ramp_down[1:])))
+        self.assertTrue(all(c.any() for c in sent[:len(ramp_down)]))   # ramp first, zeros after
+        self.assertEqual(len(zeros), tn.IDLE_TAIL_MESSAGES)
+        self.assertFalse(sent[-1].any())            # the last thing sent is a stop
+        self.assertFalse(any(self.tick(vessel) for _ in range(100)))
+
+    def test_driving_again_restarts_publishing(self):
+        vessel = self.make_vessel()
+        vessel.set_key('KeyD', True)
+        self.tick(vessel)
+        vessel.set_key('KeyD', False)
+        for _ in range(40):
+            self.tick(vessel)
+        self.assertFalse(self.tick(vessel))
+        vessel.set_key('KeyD', True)
+        self.assertTrue(self.tick(vessel))
+
+    def test_released_mid_ramp_still_ends_with_zeros(self):
+        vessel = self.make_vessel()
+        vessel.set_key('ArrowUp', True)
+        self.tick(vessel)                           # cmd 0.1, released at once
+        vessel.set_key('ArrowUp', False)
+        sent = [self.tick(vessel) for _ in range(20)]
+        self.assertEqual(sum(sent), tn.IDLE_TAIL_MESSAGES)
+
+
+class TestCommandLoopIdle(unittest.TestCase):
+    def setUp(self):
+        self.dir = os.path.join(os.path.dirname(__file__), '_tmp_teleop_idle')
+        os.makedirs(self.dir, exist_ok=True)
+        self.config = os.path.join(self.dir, 'teleop_config.json')
+        write_config(self.config, ['Mako_01'])
+
+    def tearDown(self):
+        for f in os.listdir(self.dir):
+            os.remove(os.path.join(self.dir, f))
+        os.rmdir(self.dir)
+
+    def test_loop_publishes_nothing_while_nobody_drives(self):
+        server = tn.TeleopServer(self.config, rate=50.0, ramp_seconds=0.5)
+        calls = []
+        server.vessels['Mako_01'].publish = lambda _cls: calls.append(1)
+        run_loop(server, 0.4)
+        self.assertEqual(calls, [])
+
+    def test_loop_publishes_while_a_key_is_held(self):
+        server = tn.TeleopServer(self.config, rate=50.0, ramp_seconds=0.5)
+        vessel = server.vessels['Mako_01']
+        calls = []
+        vessel.publish = lambda _cls: calls.append(1)
+        vessel.set_key('ArrowUp', True)
+        run_loop(server, 0.4)
+        self.assertGreater(len(calls), 5)
 
 
 class TestPorts(unittest.TestCase):
