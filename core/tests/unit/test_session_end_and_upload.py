@@ -8,8 +8,8 @@ Session end and bag upload (2026-11-23).
     bridge with no node commanding it sends no commands anyway. It now also
     asks the backend for the session's status every few seconds.
   - Bag uploads were cut off: they ran in a daemon thread that died with the
-    process. close() now waits for them, up to a limit, and uploads can be
-    turned off (start.sh --no-upload).
+    process. close() now waits for them, up to a limit. Uploads are off
+    unless asked for (start.sh --upload).
 
     python3 -m pytest core/tests/unit/test_session_end_and_upload.py
 """
@@ -152,6 +152,10 @@ class TestUpload:
         monkeypatch.setattr(c, '_report_recording_status', lambda *a, **k: None)
         return c
 
+    def test_off_by_default(self, monkeypatch):
+        monkeypatch.delenv('MAVSIM_UPLOAD_BAGS', raising=False)
+        assert BaseController(controller_code='TEST123').upload_bags is False
+
     def test_off_switch(self, monkeypatch):
         c = self.recording_controller(monkeypatch, upload='0')
         with patch.object(c, '_upload_bag_async') as upload:
@@ -196,4 +200,6 @@ class TestWebappStopTimeout:
 
     def test_plain_8s_without_uploads(self, monkeypatch):
         monkeypatch.setenv('MAVSIM_UPLOAD_BAGS', '0')
+        assert bridge_webapp.BridgeState._stop_timeout() == 8.0
+        monkeypatch.delenv('MAVSIM_UPLOAD_BAGS')
         assert bridge_webapp.BridgeState._stop_timeout() == 8.0

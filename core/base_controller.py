@@ -220,10 +220,10 @@ class BaseController:
         """
         self.controller_code = controller_code
         self.controller_id = _stable_controller_id()
-        # Bags are always saved locally (./recordings/ via start.sh); this
-        # also uploads each one to the backend for the dashboard's Recordings
-        # panel. start.sh --no-upload sets MAVSIM_UPLOAD_BAGS=0.
-        self.upload_bags = os.environ.get('MAVSIM_UPLOAD_BAGS', '1').strip() != '0'
+        # Bags are always saved locally (./recordings/ via start.sh). Off by
+        # default; start.sh --upload sets MAVSIM_UPLOAD_BAGS=1 to also upload
+        # each one to the backend, for the dashboard's Recordings panel.
+        self.upload_bags = os.environ.get('MAVSIM_UPLOAD_BAGS', '0').strip() == '1'
         # How long close() waits for an upload still running before exiting.
         self.upload_timeout = _env_seconds('MAVSIM_UPLOAD_TIMEOUT', 120.0)
         self._upload_thread: Optional[threading.Thread] = None
@@ -1051,7 +1051,7 @@ class BaseController:
             # before the process exits, which used to kill it mid-upload.
             if bag_path and self._api_client:
                 if not self.upload_bags:
-                    logger.info(f"Bag upload is off (--no-upload); the bag stays at {bag_path}")
+                    logger.info(f"Bag saved locally at {bag_path} (not uploaded; start.sh --upload uploads it)")
                 else:
                     self._upload_bag_path = bag_path
                     self._upload_thread = threading.Thread(

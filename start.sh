@@ -35,13 +35,13 @@
 #   ./start.sh <controller-code> [--vessel-name NAME] [--backend-url URL]
 #              [--frontend-url URL] [--rate HZ] [--ros-domain-id N]
 #              [--cmd-timeout SEC] [--observe-others] [--enable-terminal]
-#              [--rosbridge-port N] [--no-upload]
+#              [--rosbridge-port N] [--upload]
 #   ./start.sh --token /path/to/token.json [options...]
 #   ./start.sh --mode web [--port 8888] [--backend-url URL] [--frontend-url URL] [--ros-domain-id N]
-#              [--enable-terminal] [--rosbridge-port N] [--no-upload]
+#              [--enable-terminal] [--rosbridge-port N] [--upload]
 #
-# --no-upload keeps recorded bags local (./recordings/) instead of also
-# uploading them to the backend for the dashboard's Recordings panel.
+# --upload also uploads each recorded bag to the backend, for the
+# dashboard's Recordings panel. Without it bags stay local (./recordings/).
 #
 # --rosbridge-port moves the bridge's own rosbridge (used by the visualizer)
 # off 9090, e.g. when the host already runs a rosbridge there.
@@ -122,11 +122,11 @@ DEFAULT_ROSBRIDGE_PORT=9090
 # vessel it held. A container's own hostname changes on every run.
 HOST_ID="$(cat /etc/machine-id 2>/dev/null || hostname)"
 
-# Each recorded bag is saved in ./recordings/ and, unless --no-upload, also
+# Each recorded bag is saved in ./recordings/; with --upload it is also
 # uploaded to the backend (the dashboard's Recordings panel). On shutdown the
-# bridge waits up to UPLOAD_TIMEOUT s for an upload still running, so
+# bridge then waits up to UPLOAD_TIMEOUT s for an upload still running, so
 # `docker stop` is given that long too (--stop-timeout) instead of 10 s.
-UPLOAD_BAGS=1
+UPLOAD_BAGS=0
 UPLOAD_TIMEOUT=120
 RECORDINGS_DIR="$SCRIPT_DIR/recordings"
 BRIDGE_FILE="$SCRIPT_DIR/bridge_controller.py"
@@ -296,7 +296,7 @@ if [ "$MODE" = "web" ]; then
             --frontend-url)  FRONTEND_URL="$2"; shift 2 ;;
             --ros-domain-id) ROS_DOMAIN_ID_VAL="$2"; shift 2 ;;
             --rosbridge-port) ROSBRIDGE_PORT="$2"; shift 2 ;;
-            --no-upload)     UPLOAD_BAGS=0; shift ;;
+            --upload)        UPLOAD_BAGS=1; shift ;;
             --enable-terminal) ENABLE_TERMINAL=true; shift ;;
             *)               print_warn "Unknown argument: $1 (ignored)"; shift ;;
         esac
@@ -333,7 +333,7 @@ if [ "$MODE" = "web" ]; then
     fi
     echo ""
 
-    DOCKER_ARGS=(docker run --rm --name "$CONTAINER_NAME" --stop-timeout "$((UPLOAD_TIMEOUT + 20))")
+    DOCKER_ARGS=(docker run --rm --name "$CONTAINER_NAME" --stop-timeout "$(( UPLOAD_BAGS == 1 ? UPLOAD_TIMEOUT + 20 : 20 ))")
     [ "$GPU_AVAILABLE" = true ] && DOCKER_ARGS+=(--gpus all)
 
     if [ "$USE_HOST_NET" = true ]; then
@@ -404,9 +404,9 @@ if [ -z "$TOKEN_FILE" ] && [ $# -lt 1 ]; then
     print_error "(tip: run $0 with no arguments at all for web mode instead)"
     echo ""
     echo "Usage:"
-    echo "  $0 <controller-code> [--vessel-name NAME] [--backend-url URL] [--frontend-url URL] [--rate HZ] [--ros-domain-id N] [--cmd-timeout SEC] [--observe-others] [--enable-terminal] [--rosbridge-port N] [--no-upload]"
+    echo "  $0 <controller-code> [--vessel-name NAME] [--backend-url URL] [--frontend-url URL] [--rate HZ] [--ros-domain-id N] [--cmd-timeout SEC] [--observe-others] [--enable-terminal] [--rosbridge-port N] [--upload]"
     echo "  $0 --token /path/to/token.json [options...]"
-    echo "  $0 --mode web [--port 8888] [--backend-url URL] [--frontend-url URL] [--ros-domain-id N] [--enable-terminal] [--rosbridge-port N] [--no-upload]"
+    echo "  $0 --mode web [--port 8888] [--backend-url URL] [--frontend-url URL] [--ros-domain-id N] [--enable-terminal] [--rosbridge-port N] [--upload]"
     echo ""
     echo "Examples:"
     echo "  $0 ABC123"
@@ -443,7 +443,7 @@ while [[ $# -gt 0 ]]; do
         --observe-others)  OBSERVE_OTHERS=true; shift ;;
         --enable-terminal) ENABLE_TERMINAL=true; shift ;;
         --rosbridge-port)  ROSBRIDGE_PORT="$2"; shift 2 ;;
-        --no-upload)       UPLOAD_BAGS=0; shift ;;
+        --upload)          UPLOAD_BAGS=1; shift ;;
         *)                 PYTHON_ARGS+=("$1"); shift ;;
     esac
 done
@@ -485,7 +485,7 @@ fi
     print_warn "  Terminal:     ENABLED in the visualizer - a root shell for anyone who can reach port 8899"
 echo ""
 
-DOCKER_ARGS=(docker run --rm --name "$CONTAINER_NAME" --stop-timeout "$((UPLOAD_TIMEOUT + 20))")
+DOCKER_ARGS=(docker run --rm --name "$CONTAINER_NAME" --stop-timeout "$(( UPLOAD_BAGS == 1 ? UPLOAD_TIMEOUT + 20 : 20 ))")
 [ "$GPU_AVAILABLE" = true ] && DOCKER_ARGS+=(--gpus all)
 
 if [ "$USE_HOST_NET" = true ]; then

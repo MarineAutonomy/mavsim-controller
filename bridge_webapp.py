@@ -155,10 +155,10 @@ class BridgeState:
     def _stop_timeout() -> float:
         """How long stop() waits for the controller before killing it: 8 s
         for close() itself, plus the time close() gives a bag upload still
-        running (MAVSIM_UPLOAD_TIMEOUT) when uploads are on - a flat 8 s used
-        to kill the upload mid-way. A controller with nothing to upload
-        exits well inside 8 s either way."""
-        if os.environ.get("MAVSIM_UPLOAD_BAGS", "1").strip() == "0":
+        running (MAVSIM_UPLOAD_TIMEOUT) when uploads are on (start.sh
+        --upload) - a flat 8 s used to kill the upload mid-way. A controller
+        with nothing to upload exits well inside 8 s either way."""
+        if os.environ.get("MAVSIM_UPLOAD_BAGS", "0").strip() != "1":
             return 8.0
         try:
             upload = max(0.0, float(os.environ.get("MAVSIM_UPLOAD_TIMEOUT", 120.0)))
