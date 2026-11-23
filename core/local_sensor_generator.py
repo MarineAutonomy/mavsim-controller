@@ -2,8 +2,9 @@
 """
 Local Sensor Generator for mavsim Controller Docker
 
-Generates IMU, GPS, DVL, and Encoder sensor measurements locally from
-vessel_state and vessel_state_der data received via rosbridge. This moves
+Generates IMU, GPS, DVL, UWB, depth, compass, encoder and wave-probe
+measurements locally from vessel_state and vessel_state_der data received via
+rosbridge. The simulator publishes none of these itself. This moves
 non-perception sensor generation from the server to the controller Docker,
 consistent with the client-side rendering architecture.
 
@@ -190,15 +191,20 @@ class LocalIMUSensor:
         v_bcs = state[0:3]
         alpha = state_der[3:6]
 
-        q_sensor = _rotm_to_quat(_quat_to_rotm(quat) @ _quat_to_rotm(orientation_quat))
+        # True sensor attitude, and the reported one with attitude noise. Gravity
+        # is projected with the true one: the accelerometer feels the real
+        # gravity direction, not the attitude estimate's error (projecting with
+        # the noisy one leaked ~g * attitude noise, ~0.1 m/s^2 at the default
+        # 0.01 rad, into accel x/y).
+        q_true = _rotm_to_quat(_quat_to_rotm(quat) @ _quat_to_rotm(orientation_quat))
         q_sensor = _eul_to_quat(
-            _quat_to_eul(q_sensor) + np.random.multivariate_normal(np.zeros(3), self.eul_cov)
+            _quat_to_eul(q_true) + np.random.multivariate_normal(np.zeros(3), self.eul_cov)
         )
 
         acc_bcs = state_der[0:3] + np.cross(omg_bcs, v_bcs)
         acc_s_bcs = acc_bcs + np.cross(alpha, self.location) + np.cross(omg_bcs, np.cross(omg_bcs, self.location))
         acc_sensor = _quat_to_rotm(orientation_quat).T @ acc_s_bcs
-        acc_sensor = acc_sensor + _quat_to_rotm(q_sensor).T @ np.array([0, 0, -self.gravity])
+        acc_sensor = acc_sensor + _quat_to_rotm(q_true).T @ np.array([0, 0, -self.gravity])
         acc_sensor = acc_sensor + np.random.multivariate_normal(np.zeros(3), self.lin_acc_cov)
 
         omg_sensor = _quat_to_rotm(orientation_quat).T @ omg_bcs
@@ -398,6 +404,108 @@ class LocalWaveProbeSensor:
         return {'elevation': eta, 'x': float(x), 'y': float(y)}
 
 
+def _scalar_variance(custom_cov: dict, key: str, default: float) -> float:
+    """A 1x1 variance from the configurator, saved as [v] (or a bare v)."""
+    value = custom_cov.get(key) if custom_cov else None
+    if value is None:
+        return default
+    return float(np.asarray(value, dtype=float).flatten()[0])
+
+
+def _pose_covariance(position_cov=None, yaw_var=None) -> np.ndarray:
+    """6x6 pose covariance (x, y, z, roll, pitch, yaw), flattened. Fields the
+    sensor does not measure get variance -1, as the simulator's UWB did."""
+    cov = -np.eye(6)
+    if position_cov is not None:
+        position_cov = np.asarray(position_cov, dtype=float)
+        if position_cov.shape == (3, 3):
+            cov[0:3, 0:3] = position_cov
+        else:  # depth: z only
+            cov[2, 2] = float(position_cov)
+    if yaw_var is not None:
+        cov[5, 5] = yaw_var
+    return cov.flatten()
+
+
+class LocalUWBSensor:
+    """UWB position fix in NED: the sensor's position plus noise. Same model
+    as the simulator's UWBSensor (module_sensors.py)."""
+
+    def __init__(self, sensor_config: dict):
+        self.sensor_type = 'UWB'
+        self.rate = sensor_config.get('publish_rate', 10)
+        self.location = np.array(sensor_config.get('sensor_location', [0, 0, 0]), dtype=float)
+        self.uwb_cov = np.eye(3)  # 1 m rms, the simulator's default
+
+        custom_cov = sensor_config.get('custom_covariance') or sensor_config.get('covariance') or {}
+        if custom_cov and 'position_covariance' in custom_cov:
+            self.uwb_cov = np.array(custom_cov['position_covariance'], dtype=float).reshape(3, 3)
+        self.covariance = _pose_covariance(position_cov=self.uwb_cov)
+
+    def get_measurement(self, state: np.ndarray, state_der: np.ndarray,
+                        use_quaternion: bool = False, **kwargs) -> dict:
+        orientation = state[9:13] if use_quaternion else _eul_to_quat(state[9:12])
+        ned = state[6:9] + _quat_to_rotm(orientation) @ self.location
+        ned = ned + np.random.multivariate_normal(np.zeros(3), self.uwb_cov)
+        return {
+            'position': ned,
+            'orientation': np.array([1.0, 0.0, 0.0, 0.0]),
+            'covariance': self.covariance,
+        }
+
+
+class LocalDepthSensor:
+    """Depth (m, positive down) of the sensor's location, plus noise. Published
+    as a pose with only z set."""
+
+    def __init__(self, sensor_config: dict):
+        self.sensor_type = 'depth'
+        self.rate = sensor_config.get('publish_rate', 10)
+        self.location = np.array(sensor_config.get('sensor_location', [0, 0, 0]), dtype=float)
+        custom_cov = sensor_config.get('custom_covariance') or sensor_config.get('covariance') or {}
+        self.variance = _scalar_variance(custom_cov, 'depth_covariance', 0.1 ** 2)
+        self.covariance = _pose_covariance(position_cov=self.variance)
+
+    def get_measurement(self, state: np.ndarray, state_der: np.ndarray,
+                        use_quaternion: bool = False, **kwargs) -> dict:
+        orientation = state[9:13] if use_quaternion else _eul_to_quat(state[9:12])
+        depth = (state[6:9] + _quat_to_rotm(orientation) @ self.location)[2]
+        depth = float(depth + np.random.normal(0.0, np.sqrt(self.variance)))
+        return {
+            'depth': depth,
+            'position': np.array([0.0, 0.0, depth]),
+            'orientation': np.array([1.0, 0.0, 0.0, 0.0]),
+            'covariance': self.covariance,
+        }
+
+
+class LocalCompassSensor:
+    """Heading (rad, NED yaw of the sensor, in [-pi, pi]) plus noise. Published
+    as a pose with only a yaw-only orientation set. The configurator's
+    heading variance is in rad^2, like the IMU's orientation covariance."""
+
+    def __init__(self, sensor_config: dict):
+        self.sensor_type = 'compass'
+        self.rate = sensor_config.get('publish_rate', 10)
+        self.orientation = np.array(sensor_config.get('sensor_orientation', [0, 0, 0]), dtype=float) * np.pi / 180.0
+        custom_cov = sensor_config.get('custom_covariance') or sensor_config.get('covariance') or {}
+        self.variance = _scalar_variance(custom_cov, 'heading_covariance', np.deg2rad(2.0) ** 2)
+        self.covariance = _pose_covariance(yaw_var=self.variance)
+
+    def get_measurement(self, state: np.ndarray, state_der: np.ndarray,
+                        use_quaternion: bool = False, **kwargs) -> dict:
+        quat = state[9:13] if use_quaternion else _eul_to_quat(state[9:12])
+        rotm = _quat_to_rotm(quat) @ _eul_to_rotm(self.orientation)
+        heading = np.arctan2(rotm[1, 0], rotm[0, 0])
+        heading = _ssa(heading + np.random.normal(0.0, np.sqrt(self.variance)))
+        return {
+            'heading': float(heading),
+            'position': np.zeros(3),
+            'orientation': _eul_to_quat(np.array([0.0, 0.0, heading])),
+            'covariance': self.covariance,
+        }
+
+
 # ---------------------------------------------------------------------------
 # Sensor generator orchestrator
 # ---------------------------------------------------------------------------
@@ -406,6 +514,9 @@ _SENSOR_FACTORY = {
     'imu': lambda cfg, **kw: LocalIMUSensor(cfg, gravity=kw.get('gravity', 9.80665)),
     'gps': lambda cfg, **kw: LocalGPSSensor(cfg, gps_datum=kw.get('gps_datum', [0, 0, 0])),
     'dvl': lambda cfg, **kw: LocalDVLSensor(cfg),
+    'uwb': lambda cfg, **kw: LocalUWBSensor(cfg),
+    'depth': lambda cfg, **kw: LocalDepthSensor(cfg),
+    'compass': lambda cfg, **kw: LocalCompassSensor(cfg),
     'encoder': lambda cfg, **kw: LocalEncoderSensor(
         cfg,
         n_control_surfaces=kw.get('n_control_surfaces', 0),

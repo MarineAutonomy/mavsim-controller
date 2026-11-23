@@ -311,7 +311,9 @@ class MavsimAPIClient:
             backend_url: Backend URL (e.g., http://localhost:5000)
             controller_code: Short controller code from UI
             vessel_name: Vessel name (optional, auto-assigned for single-vessel sessions)
-            controller_id: Optional controller identifier for logging
+            controller_id: Identifies this controller across restarts; the
+                backend records it with the vessel binding (see
+                base_controller._stable_controller_id)
             timeout: Request timeout in seconds
             
         Returns:
@@ -690,6 +692,7 @@ class RoslibSubscriber:
         self._vessel_state_der_topics: list = []
         self._reset_event_topic = None
         self._state_der_callbacks: List[Callable] = []
+        self._state_callbacks: List[Callable] = []
         
         logger.info(f"Roslib subscriber initialized: {self.rosbridge_url}")
     
@@ -945,6 +948,11 @@ class RoslibSubscriber:
                 # Store raw state array (strip timestamp) for sensor generation
                 self._raw_vessel_states[ros_name] = np.array(data[1:])
                 self._raw_vessel_state_times[ros_name] = float(data[0])
+            for cb in self._state_callbacks:
+                try:
+                    cb(ros_name, data)
+                except Exception as e:
+                    logger.debug(f"vessel_state callback error for {ros_name}: {e}")
         except Exception as e:
             logger.warning(f"Error parsing vessel_state for {ros_name}: {e}")
 
@@ -1012,6 +1020,12 @@ class RoslibSubscriber:
     def add_state_der_callback(self, callback: Callable):
         """Register a callback(ros_name, data_list) for vessel_state_der updates."""
         self._state_der_callbacks.append(callback)
+
+    def add_state_callback(self, callback: Callable):
+        """Register a callback(ros_name, data_list) for each vessel_state
+        message, called on the rosbridge thread as it arrives (data_list
+        still has the leading sim time)."""
+        self._state_callbacks.append(callback)
 
     def subscribe_reset_event(self, callback: Callable[[int], None]) -> bool:
         """Subscribe to the session's sim_reset_event (std_msgs/UInt32: the
@@ -1590,6 +1604,14 @@ class MavsimController:
     def get_raw_state_time(self, ros_name: str) -> Optional[float]:
         """Return the elapsed sim time (s) of the latest vessel_state message."""
         return self.subscriber.get_raw_state_time(ros_name)
+
+    def add_state_callback(self, callback: Callable):
+        """callback(ros_name, data_list) on every vessel_state message."""
+        self.subscriber.add_state_callback(callback)
+
+    def add_state_der_callback(self, callback: Callable):
+        """callback(ros_name, data_list) on every vessel_state_der message."""
+        self.subscriber.add_state_der_callback(callback)
 
     def set_target(self, x: float, y: float, heading: Optional[float] = None):
         """
