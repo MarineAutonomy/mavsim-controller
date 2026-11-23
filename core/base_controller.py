@@ -133,6 +133,13 @@ def _stable_controller_id() -> str:
     return 'bridge-' + hashlib.sha256(host.encode()).hexdigest()[:16]
 
 
+def _env_seconds(name: str, default: float) -> float:
+    try:
+        return max(0.0, float(os.environ.get(name, default)))
+    except ValueError:
+        return default
+
+
 def _stamp_now(node=None):
     """builtin_interfaces/Time for now: from the node's clock when there is
     one (wall-clock time unless use_sim_time is set), else time.time()."""
@@ -213,6 +220,14 @@ class BaseController:
         """
         self.controller_code = controller_code
         self.controller_id = _stable_controller_id()
+        # Bags are always saved locally (./recordings/ via start.sh); this
+        # also uploads each one to the backend for the dashboard's Recordings
+        # panel. start.sh --no-upload sets MAVSIM_UPLOAD_BAGS=0.
+        self.upload_bags = os.environ.get('MAVSIM_UPLOAD_BAGS', '1').strip() != '0'
+        # How long close() waits for an upload still running before exiting.
+        self.upload_timeout = _env_seconds('MAVSIM_UPLOAD_TIMEOUT', 120.0)
+        self._upload_thread: Optional[threading.Thread] = None
+        self._upload_bag_path: Optional[str] = None
         self.frontend_url = frontend_url
         self.backend_url = backend_url
         self.vessel_name = vessel_name
@@ -1031,19 +1046,38 @@ class BaseController:
             self._report_recording_status('stopped', self._recording_topics)
             logger.info("Recording stopped")
 
-            # Upload to cloud backend in a background thread so it doesn't
-            # block the polling loop or controller shutdown.
+            # Upload to the backend in a background thread so it doesn't block
+            # the polling loop; close() waits for it (up to upload_timeout)
+            # before the process exits, which used to kill it mid-upload.
             if bag_path and self._api_client:
-                upload_thread = threading.Thread(
-                    target=self._upload_bag_async,
-                    args=(bag_path,),
-                    daemon=True,
-                )
-                upload_thread.start()
+                if not self.upload_bags:
+                    logger.info(f"Bag upload is off (--no-upload); the bag stays at {bag_path}")
+                else:
+                    self._upload_bag_path = bag_path
+                    self._upload_thread = threading.Thread(
+                        target=self._upload_bag_async,
+                        args=(bag_path,),
+                        daemon=True,
+                        name="bag-upload",
+                    )
+                    self._upload_thread.start()
 
         except Exception as e:
             logger.error(f"Failed to stop recording: {e}")
             self._report_recording_status('error', self._recording_topics, error=str(e))
+
+    def _wait_for_upload(self):
+        """Give a running bag upload up to upload_timeout to finish."""
+        thread = self._upload_thread
+        if thread is None or not thread.is_alive():
+            return
+        logger.info(f"Waiting up to {self.upload_timeout:.0f} s for the bag upload to finish...")
+        thread.join(timeout=self.upload_timeout)
+        if thread.is_alive():
+            logger.warning(
+                f"Bag upload did not finish within {self.upload_timeout:.0f} s and was abandoned; "
+                f"the bag is still saved locally at {self._upload_bag_path}"
+            )
 
     def _upload_bag_async(self, bag_path: str):
         """Background upload of a bag file to the cloud backend."""
@@ -1091,10 +1125,20 @@ class BaseController:
             logger.debug(f"Failed to poll recording command: {e}")
             return None
     
+    SESSION_CHECK_PERIOD = 5.0  # seconds between session status checks
+
     def _poll_recording_loop(self):
-        """Background thread that polls for recording commands."""
+        """Background thread that polls the backend: for recording commands
+        every 2 s, and for the session's status every SESSION_CHECK_PERIOD,
+        so the bridge notices a stopped session even when nothing is
+        commanding it (the control loop then shuts it down, finalizing and
+        uploading any recording)."""
         MAX_RECORDING_RETRIES = 10
+        next_session_check = time.monotonic() + self.SESSION_CHECK_PERIOD
         while self._polling_active:
+            if time.monotonic() >= next_session_check:
+                next_session_check = time.monotonic() + self.SESSION_CHECK_PERIOD
+                self._check_session_status()
             try:
                 command_data = self.poll_recording_command()
                 
@@ -1115,6 +1159,17 @@ class BaseController:
             
             time.sleep(2.0)
     
+    def _check_session_status(self):
+        """One backend status check; the session is shared by all vessels,
+        so the primary client is enough."""
+        ctrl = self._controller
+        if ctrl is None or not hasattr(ctrl, 'check_session_status'):
+            return
+        try:
+            ctrl.check_session_status()
+        except Exception as e:
+            logger.debug(f"Session status check error: {e}")
+
     def _start_polling(self):
         """Start background polling thread."""
         if self._polling_active:
@@ -1834,6 +1889,13 @@ class BaseController:
 
         self._running = False
 
+        # Recording first: finalize the bag and start its upload now, so the
+        # upload runs while the rest is torn down. Polling stops before it,
+        # or its next poll would see "start" again and restart recording.
+        self._stop_polling()
+        if self._recording:
+            self.stop_recording()
+
         # Stop the observer/rosbridge/visualizer subprocesses, if running.
         # Guarded so close() being called more than once (both the
         # SIGINT/SIGTERM handler and run()'s finally block can call it) is a
@@ -1916,15 +1978,9 @@ class BaseController:
                 pass
             self._ros2_node = None
         
-        # Stop polling
-        self._stop_polling()
-        
         if self._control_thread and self._control_thread.is_alive():
             self._control_thread.join(timeout=2.0)
-        
-        if self._recording:
-            self.stop_recording()
-        
+
         # Close all vessel controllers
         for vname, ctrl in self._controllers.items():
             try:
@@ -1936,7 +1992,9 @@ class BaseController:
         # Fallback for single-vessel mode if not in _controllers
         if self._controller and self._controller not in self._controllers.values():
             self._controller.close()
-        
+
+        self._wait_for_upload()
+
         logger.info("Controller closed")
     
     def run(self, rate_hz: float = 10.0):

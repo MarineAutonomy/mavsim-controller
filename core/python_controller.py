@@ -432,10 +432,7 @@ class MavsimAPIClient:
                 # answer, so latch it and let the caller shut down instead of
                 # retrying at the control rate forever.
                 if response.status_code == 404 and 'not running' in str(error).lower():
-                    if not self.session_ended:
-                        self.session_ended = True
-                        self.session_end_reason = error_data.get('message') or error
-                        logger.info(f"Simulation session has ended: {self.session_end_reason}")
+                    self._mark_session_ended(error_data.get('message') or error)
                     return False
 
                 logger.warning(
@@ -450,6 +447,57 @@ class MavsimAPIClient:
             logger.error(f"Control command failed: {e}")
             return False
     
+    def _mark_session_ended(self, reason: str):
+        """Latch the end of the session (it cannot go back to running)."""
+        if not self.session_ended:
+            self.session_ended = True
+            self.session_end_reason = reason
+            logger.info(f"Simulation session has ended: {reason}")
+
+    # Session statuses after which the simulation will not run again.
+    _ENDED_STATUSES = ('stopped', 'error')
+
+    def check_session_status(self, timeout: float = 5.0) -> Optional[str]:
+        """Ask the backend for this session's status, and latch session_ended
+        once it is over (stopped or error) or gone.
+
+        Commands alone cannot tell: a refused command (404 "Session not
+        running") is how the end used to be noticed, but a bridge with no node
+        commanding it sends no commands, so it never found out and ran on
+        after the session ended. GET /api/simulation/observer/status takes the
+        session's own api_token, as /recording/command does.
+
+        Returns the status, or None if the backend could not be asked.
+        """
+        try:
+            response = requests.get(
+                f"{self.backend_url}/api/simulation/observer/status",
+                params={'session_id': self.session_id, 'api_token': self.api_token},
+                timeout=timeout,
+            )
+        except requests.exceptions.RequestException as e:
+            logger.debug(f"Session status check failed: {e}")
+            return None
+        try:
+            body = response.json()
+        except ValueError:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        # Only the backend's own JSON answer counts as "gone": a 404 page from
+        # a proxy or an older backend without this route must not end a
+        # session that is still running.
+        if response.status_code == 404 and body.get('error') == 'Session not found':
+            self._mark_session_ended('Session not found')
+            return None
+        if response.status_code != 200:
+            logger.debug(f"Session status check: HTTP {response.status_code}")
+            return None
+        status = body.get('status')
+        if status in self._ENDED_STATUSES:
+            self._mark_session_ended(f"session status is '{status}'")
+        return status
+
     def reset_simulation(self) -> bool:
         """
         Ask the simulation to go back to its initial conditions at t = 0.
@@ -1556,6 +1604,23 @@ class MavsimController:
     def reset_simulation(self) -> bool:
         """Ask the simulation to go back to its initial conditions at t = 0."""
         return self.api_client.reset_simulation()
+
+    # The session's end is latched on the API client (by a refused command or
+    # check_session_status()); BaseController reads it from here. It used to
+    # read these attributes off this object, which did not have them, so it
+    # never saw a session end.
+    @property
+    def session_ended(self) -> bool:
+        return self.api_client.session_ended
+
+    @property
+    def session_end_reason(self) -> Optional[str]:
+        return self.api_client.session_end_reason
+
+    def check_session_status(self) -> Optional[str]:
+        """Ask the backend whether the session is still live (see
+        MavsimAPIClient.check_session_status)."""
+        return self.api_client.check_session_status()
 
     def subscribe_reset_event(self, callback: Callable[[int], None]) -> bool:
         """Call callback(reset_count) on every reset of the simulation."""

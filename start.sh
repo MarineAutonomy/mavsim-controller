@@ -35,10 +35,13 @@
 #   ./start.sh <controller-code> [--vessel-name NAME] [--backend-url URL]
 #              [--frontend-url URL] [--rate HZ] [--ros-domain-id N]
 #              [--cmd-timeout SEC] [--observe-others] [--enable-terminal]
-#              [--rosbridge-port N]
+#              [--rosbridge-port N] [--no-upload]
 #   ./start.sh --token /path/to/token.json [options...]
 #   ./start.sh --mode web [--port 8888] [--backend-url URL] [--frontend-url URL] [--ros-domain-id N]
-#              [--enable-terminal] [--rosbridge-port N]
+#              [--enable-terminal] [--rosbridge-port N] [--no-upload]
+#
+# --no-upload keeps recorded bags local (./recordings/) instead of also
+# uploading them to the backend for the dashboard's Recordings panel.
 #
 # --rosbridge-port moves the bridge's own rosbridge (used by the visualizer)
 # off 9090, e.g. when the host already runs a rosbridge there.
@@ -118,6 +121,13 @@ DEFAULT_ROSBRIDGE_PORT=9090
 # handshake's controllerId), so a bridge restarted here can take back the
 # vessel it held. A container's own hostname changes on every run.
 HOST_ID="$(cat /etc/machine-id 2>/dev/null || hostname)"
+
+# Each recorded bag is saved in ./recordings/ and, unless --no-upload, also
+# uploaded to the backend (the dashboard's Recordings panel). On shutdown the
+# bridge waits up to UPLOAD_TIMEOUT s for an upload still running, so
+# `docker stop` is given that long too (--stop-timeout) instead of 10 s.
+UPLOAD_BAGS=1
+UPLOAD_TIMEOUT=120
 RECORDINGS_DIR="$SCRIPT_DIR/recordings"
 BRIDGE_FILE="$SCRIPT_DIR/bridge_controller.py"
 WEBAPP_FILE="$SCRIPT_DIR/bridge_webapp.py"
@@ -286,6 +296,7 @@ if [ "$MODE" = "web" ]; then
             --frontend-url)  FRONTEND_URL="$2"; shift 2 ;;
             --ros-domain-id) ROS_DOMAIN_ID_VAL="$2"; shift 2 ;;
             --rosbridge-port) ROSBRIDGE_PORT="$2"; shift 2 ;;
+            --no-upload)     UPLOAD_BAGS=0; shift ;;
             --enable-terminal) ENABLE_TERMINAL=true; shift ;;
             *)               print_warn "Unknown argument: $1 (ignored)"; shift ;;
         esac
@@ -309,7 +320,7 @@ if [ "$MODE" = "web" ]; then
     [ "$FRONTEND_URL" != "$CONTAINER_FRONTEND_URL" ] && \
         print_info "  (inside container: $CONTAINER_FRONTEND_URL)"
     print_info "  ROS_DOMAIN_ID: $ROS_DOMAIN_ID_VAL"
-    print_info "  Recordings:    $RECORDINGS_DIR"
+    print_info "  Recordings:    $RECORDINGS_DIR (upload to backend: $([ "$UPLOAD_BAGS" = 1 ] && echo on || echo off))"
     print_info "  Visualizer:    http://localhost:8899 (time histories, camera, point cloud, overlay)"
     print_info "  Rosbridge:     port $ROSBRIDGE_PORT (the visualizer's)"
     print_info "  Teleop:        http://localhost:8900 (keyboard control)"
@@ -322,7 +333,7 @@ if [ "$MODE" = "web" ]; then
     fi
     echo ""
 
-    DOCKER_ARGS=(docker run --rm --name "$CONTAINER_NAME")
+    DOCKER_ARGS=(docker run --rm --name "$CONTAINER_NAME" --stop-timeout "$((UPLOAD_TIMEOUT + 20))")
     [ "$GPU_AVAILABLE" = true ] && DOCKER_ARGS+=(--gpus all)
 
     if [ "$USE_HOST_NET" = true ]; then
@@ -346,6 +357,8 @@ if [ "$MODE" = "web" ]; then
         -e "FASTDDS_BUILTIN_TRANSPORTS=$FASTDDS_BUILTIN_TRANSPORTS_VAL"
         -e "MAVSIM_ROSBRIDGE_PORT=$ROSBRIDGE_PORT"
         -e "MAVSIM_HOST_ID=$HOST_ID"
+        -e "MAVSIM_UPLOAD_BAGS=$UPLOAD_BAGS"
+        -e "MAVSIM_UPLOAD_TIMEOUT=$UPLOAD_TIMEOUT"
         -v "$RECORDINGS_DIR:/tmp/mavsim_bags"
         -v "$BRIDGE_FILE:/app/user_code/my_controller.py:ro"
         -v "$WEBAPP_FILE:/app/user_code/bridge_webapp.py:ro"
@@ -391,9 +404,9 @@ if [ -z "$TOKEN_FILE" ] && [ $# -lt 1 ]; then
     print_error "(tip: run $0 with no arguments at all for web mode instead)"
     echo ""
     echo "Usage:"
-    echo "  $0 <controller-code> [--vessel-name NAME] [--backend-url URL] [--frontend-url URL] [--rate HZ] [--ros-domain-id N] [--cmd-timeout SEC] [--observe-others] [--enable-terminal] [--rosbridge-port N]"
+    echo "  $0 <controller-code> [--vessel-name NAME] [--backend-url URL] [--frontend-url URL] [--rate HZ] [--ros-domain-id N] [--cmd-timeout SEC] [--observe-others] [--enable-terminal] [--rosbridge-port N] [--no-upload]"
     echo "  $0 --token /path/to/token.json [options...]"
-    echo "  $0 --mode web [--port 8888] [--backend-url URL] [--frontend-url URL] [--ros-domain-id N] [--enable-terminal] [--rosbridge-port N]"
+    echo "  $0 --mode web [--port 8888] [--backend-url URL] [--frontend-url URL] [--ros-domain-id N] [--enable-terminal] [--rosbridge-port N] [--no-upload]"
     echo ""
     echo "Examples:"
     echo "  $0 ABC123"
@@ -430,6 +443,7 @@ while [[ $# -gt 0 ]]; do
         --observe-others)  OBSERVE_OTHERS=true; shift ;;
         --enable-terminal) ENABLE_TERMINAL=true; shift ;;
         --rosbridge-port)  ROSBRIDGE_PORT="$2"; shift 2 ;;
+        --no-upload)       UPLOAD_BAGS=0; shift ;;
         *)                 PYTHON_ARGS+=("$1"); shift ;;
     esac
 done
@@ -455,7 +469,7 @@ print_info "  Frontend:     $FRONTEND_URL"
     print_info "  (inside container: $CONTAINER_FRONTEND_URL)"
 print_info "  ROS_DOMAIN_ID: $ROS_DOMAIN_ID_VAL"
 print_info "  Cmd timeout:  ${CMD_TIMEOUT}s"
-print_info "  Recordings:   $RECORDINGS_DIR"
+print_info "  Recordings:   $RECORDINGS_DIR (upload to backend: $([ "$UPLOAD_BAGS" = 1 ] && echo on || echo off))"
 [ -n "$VESSEL_NAME" ]        && print_info "  Vessel:       $VESSEL_NAME"
 print_info "  Sensors:      always enabled (camera/lidar via headless observer)"
 print_info "  Visualizer:   http://localhost:8899 (time histories, camera, point cloud, overlay)"
@@ -471,7 +485,7 @@ fi
     print_warn "  Terminal:     ENABLED in the visualizer - a root shell for anyone who can reach port 8899"
 echo ""
 
-DOCKER_ARGS=(docker run --rm --name "$CONTAINER_NAME")
+DOCKER_ARGS=(docker run --rm --name "$CONTAINER_NAME" --stop-timeout "$((UPLOAD_TIMEOUT + 20))")
 [ "$GPU_AVAILABLE" = true ] && DOCKER_ARGS+=(--gpus all)
 
 if [ "$USE_HOST_NET" = true ]; then
@@ -490,6 +504,8 @@ DOCKER_ARGS+=(-e "FASTDDS_BUILTIN_TRANSPORTS=$FASTDDS_BUILTIN_TRANSPORTS_VAL")
 DOCKER_ARGS+=(-e "MAVSIM_CMD_TIMEOUT=$CMD_TIMEOUT")
 DOCKER_ARGS+=(-e "MAVSIM_ROSBRIDGE_PORT=$ROSBRIDGE_PORT")
 DOCKER_ARGS+=(-e "MAVSIM_HOST_ID=$HOST_ID")
+DOCKER_ARGS+=(-e "MAVSIM_UPLOAD_BAGS=$UPLOAD_BAGS")
+DOCKER_ARGS+=(-e "MAVSIM_UPLOAD_TIMEOUT=$UPLOAD_TIMEOUT")
 [ "$OBSERVE_OTHERS" = true ] && DOCKER_ARGS+=(-e "MAVSIM_OBSERVE_OTHERS=1")
 [ "$ENABLE_TERMINAL" = true ] && DOCKER_ARGS+=(-e "MAVSIM_ENABLE_TERMINAL=1")
 
