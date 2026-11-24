@@ -562,7 +562,9 @@ class LocalSensorGenerator:
     def __init__(self, vessel_config: dict, vessel_name: str = '',
                  use_quaternion: bool = False,
                  on_measurement: Optional[Callable] = None,
-                 wave_environment: Optional[dict] = None):
+                 wave_environment: Optional[dict] = None,
+                 gps_datum: Optional[list] = None,
+                 gravity: Optional[float] = None):
         """
         Args:
             vessel_config: Full agent config dict from handshake vesselConfig
@@ -573,13 +575,26 @@ class LocalSensorGenerator:
             wave_environment: Session-wide wave component list (not per-vessel),
                            consumed by any 'WaveProbe' sensor in this vessel's
                            sensor list. See BaseController._wave_environment.
+            gps_datum: Session-wide [lat, lon, alt] the GPS fixes are about (the
+                           config's top-level gps_datum; vesselConfig has none).
+                           Overrides vessel_config['gps_datum'].
+            gravity: Session-wide gravity [m/s^2]; overrides vessel_config['gravity'].
         """
         self.vessel_name = vessel_name
         self.use_quaternion = use_quaternion
         self.on_measurement = on_measurement
 
-        gravity = vessel_config.get('gravity', 9.80665)
-        gps_datum = vessel_config.get('gps_datum', [0, 0, 0])
+        if gravity is None:
+            gravity = vessel_config.get('gravity', 9.80665)
+        if gps_datum is None:
+            gps_datum = vessel_config.get('gps_datum')
+        if gps_datum is None:
+            if any(str(sc.get('sensor_type', '')).lower() == 'gps'
+                   for sc in _extract_sensor_list(vessel_config)):
+                logger.warning(
+                    f"{vessel_name}: no GPS datum known (config gps_datum not received): "
+                    "GPS fixes are generated about lat/lon (0, 0)")
+            gps_datum = [0, 0, 0]
 
         cs_list = vessel_config.get('control_surfaces')
         if isinstance(cs_list, dict):
