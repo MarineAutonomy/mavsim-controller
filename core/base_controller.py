@@ -22,7 +22,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 
@@ -303,6 +303,14 @@ class BaseController:
         # other client-side sensor.
         self._wave_environment: Dict = {'components': [], 'standalone_probes': []}
 
+        # Session-wide physical settings the local sensors need but the per-vessel
+        # vesselConfig (an agents[] block) does not carry: the GPS datum and gravity
+        # are top-level keys of the config. From the handshake (gpsDatum, newer
+        # backends) or the fullConfig fetched below; None until known. Without the
+        # datum, GPS fixes would be generated about lat/lon (0, 0).
+        self._gps_datum: Optional[List[float]] = None
+        self._gravity: Optional[float] = None
+
         # Recording state
         self._recording = False
         self._recording_topics = []
@@ -494,6 +502,8 @@ class BaseController:
             vessel_config = handshake_data.get('vesselConfig', {})
             vessels = handshake_data.get('vessels', [])
             use_quaternion = handshake_data.get('useQuaternion', False)
+            if isinstance(handshake_data.get('gpsDatum'), (list, tuple)):
+                self._gps_datum = [float(v) for v in handshake_data['gpsDatum']]
 
             vessel_id_int = self._extract_vessel_id(bound_name, vessels)
 
@@ -627,6 +637,8 @@ class BaseController:
                 use_quaternion=use_quat,
                 on_measurement=make_callback(vname),
                 wave_environment=self._wave_environment,
+                gps_datum=self._gps_datum,
+                gravity=self._gravity,
             )
             self._sensor_generators[vname] = gen
 
@@ -1839,6 +1851,12 @@ class BaseController:
             self._wave_environment = full_config.get(
                 "wave_environment", {"components": [], "standalone_probes": []}
             )
+            # Same for the GPS datum and gravity (top-level keys, not in vesselConfig).
+            # This also covers backends whose handshake has no gpsDatum yet.
+            if isinstance(full_config.get("gps_datum"), (list, tuple)):
+                self._gps_datum = [float(v) for v in full_config["gps_datum"]]
+            if isinstance(full_config.get("gravity"), (int, float)):
+                self._gravity = float(full_config["gravity"])
 
             # Agents don't carry their own ROS name - it's constructed the same
             # way python_controller.py builds full_vessel_name: f"{name}_{vessel_id}"
